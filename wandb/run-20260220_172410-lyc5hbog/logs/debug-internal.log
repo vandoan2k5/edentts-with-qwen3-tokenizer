@@ -1,0 +1,6 @@
+{"time":"2026-02-20T17:24:10.600700251Z","level":"INFO","msg":"stream: starting","core version":"0.25.0"}
+{"time":"2026-02-20T17:24:10.745457293Z","level":"INFO","msg":"stream: created new stream","id":"lyc5hbog"}
+{"time":"2026-02-20T17:24:10.745695083Z","level":"INFO","msg":"stream: started","id":"lyc5hbog"}
+{"time":"2026-02-20T17:24:10.745905392Z","level":"INFO","msg":"handler: started","stream_id":"lyc5hbog"}
+{"time":"2026-02-20T17:24:10.745939387Z","level":"INFO","msg":"sender: started","stream_id":"lyc5hbog"}
+{"time":"2026-02-20T17:24:10.745942611Z","level":"INFO","msg":"writer: started","stream_id":"lyc5hbog"}
