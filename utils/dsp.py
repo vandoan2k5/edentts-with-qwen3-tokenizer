@@ -94,7 +94,7 @@ def melspectrogram(y, center=False, np=False):
     global mel_basis, hann_window
     if hp.fmax not in mel_basis:
         # 构造mel_filter banks, 频谱图经过mel系数谱就得到mel谱了, 默认使用slaney, 使用norm
-        mel = librosa_mel_fn(hp.sample_rate, hp.n_fft, hp.num_mels, hp.fmin, hp.fmax)
+        mel = librosa_mel_fn(sr=hp.sample_rate, n_fft=hp.n_fft, n_mels=hp.num_mels, fmin=hp.fmin, fmax=hp.fmax)
         mel_basis[str(hp.fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(hp.win_length).to(y.device)
     # 音频前后pad若干个0。

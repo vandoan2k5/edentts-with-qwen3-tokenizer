@@ -5,13 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "flash-attn>=2.8.3",
     "g2p-en>=2.1.0",
     "ipykernel>=7.2.0",
     "librosa>=0.11.0",
     "matplotlib>=3.10.8",
     "piper-phonemize>=1.1.0",
+    "qwen-tts>=0.1.1",
+    "setuptools>=82.0.0",
     "torch>=2.10.0",
     "torchcodec>=0.10.0",
     "torchvision>=0.25.0",
     "tqdm>=4.67.3",
+    "unidecode>=1.4.0",
 ]

@@ -23,16 +23,20 @@ paths = Paths(hp.data_path, speaker="ljs")
 
 def convert_file(path: Path):
     y = load_wav(path)
+    print(f"Loaded {path} with shape {y.shape} and sample rate {hp.sample_rate}")
     peak = np.abs(y).max()
     y /= peak
     mel = melspectrogram(y, np=True)
+    print(f"Computed mel spectrogram with shape {mel.shape}")
     quant = float_2_label(y, bits=16)
+    print(f"Quantized audio to shape {quant.shape} with {hp.bits} bits")
     return mel.astype(np.float32), quant.astype(np.int64)
 
 
 def process_wav(path: Path):
     wav_id = path.stem
     m, x = convert_file(path)
+    print(f"Saving mel spectrogram and quantized audio for {wav_id}")
     np.save(paths.mel/f'{wav_id}.npy', m, allow_pickle=False)
     np.save(paths.quant/f'{wav_id}.npy', x, allow_pickle=False)
     return wav_id, m.shape[-1]
@@ -48,6 +52,7 @@ def main(wav_path, n_workers=4):
     ])
     print("wav processing........")
     wav_files = get_files(wav_path, ".wav")
+    print(f"Found {len(wav_files)} wav files in {wav_path}")
     pool = Pool(processes=n_workers)
     dataset = []
     for i, (item_id, length) in enumerate(pool.imap_unordered(process_wav, wav_files), 1):
@@ -62,6 +67,7 @@ def main(wav_path, n_workers=4):
     log.info(f"data path is {paths.data}, token type:{hp.token_type}")
     print("wav processing........")
     meta_file = get_files(wav_path, ".csv")[0]
+    print(meta_file)
     with open(meta_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
         for i, line in enumerate(lines):
@@ -100,6 +106,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("-n", "--n_workers", type=int, default=4)
     args = parser.parse_args()
-    args.wav_path = r"G:\dataset\LJSpeech\LJSpeech-1.1"
+    args.wav_path = r"/kaggle/eden_tts/LJSpeech-1.1"
     main(args.wav_path, n_workers=args.n_workers)
 

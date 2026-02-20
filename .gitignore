@@ -13,3 +13,6 @@ wheels/
 LJSpeech-1.1/
 architecture.png
 LJSpeech-1.1.tar.bz2
+*.png
+*.wav
+data/
