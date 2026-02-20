@@ -27,6 +27,7 @@ class EdenTTS(AbstractModel):
         self.delta = h.delta
         self.n_mels = h.num_mels  # Thường là 16 tầng Codebook
         self.vocab_size = 2048    # Kích thước từ điển của Qwen3
+        self.audio_emb = nn.Embedding(self.vocab_size, h.n_channels)
 
         self.text_encoder = TextEncoder(n_channels=h.n_channels,
                                         encoder_layer=h.text_encoder_layers,
@@ -34,7 +35,7 @@ class EdenTTS(AbstractModel):
                                         encoder_dropout=h.text_encoder_dropout,
                                         vocab_size=h.vocab_size)
 
-        self.mel_encoder = MelEncoder(n_mels=h.num_mels,
+        self.mel_encoder = MelEncoder(n_mels=h.n_channels,
                                       n_channels=h.n_channels,
                                       nonlinear_activation=nonlinear_activation,
                                       nonlinear_activation_params=nonlinear_activation_params,
@@ -91,10 +92,6 @@ class EdenTTS(AbstractModel):
         mel_mask = ~make_non_pad_mask(mel_lens).to(device)
         
         text_key, text_value = self.text_encoder(phone_ids, text_lengths)
-        
-        # speech lúc này là Token IDs (Long) đã transpose thành (B, 16, T)
-        # MelEncoder của bạn cần float, ta chuyển đổi tạm thời
-        # speech_input = speech.float().transpose(1, 2)  # Chuyển thành [B, 16, Time]
         mel_h = self.mel_encoder(speech)
 
         alpha = scaled_dot_attention(key=text_key, key_lens=text_lengths, query=mel_h,
@@ -115,9 +112,10 @@ class EdenTTS(AbstractModel):
         )
         _tmp_mask_2 = mel_mask.unsqueeze(1).repeat(1, text_value.size(2), 1)
         text_value_expanded = text_value_expanded.masked_fill(_tmp_mask_2, 0.0)
-        
+
+        target_layer0 = speech[:, :, 0]
         # mel_pred lúc này là Logits có shape: [B, Time, 16, 2048]
-        mel_pred = self.decoder(text_value_expanded.transpose(1, 2))
+        mel_pred = self.decoder(text_value_expanded.transpose(1, 2), target_layer0=target_layer0)
         
         # Trả về các thành phần phục vụ tính CrossEntropy Loss
         return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
@@ -148,6 +146,7 @@ class EdenTTS(AbstractModel):
             
             # mel_pred_logits: [1, Time, 16, 2048]
             mel_pred_logits = self.decoder(text_value_expanded)
+            # mel_pred_logits = mel_pred_logits.view(1, -1, self.n_mels, self.vocab_size)
             
             # Lấy index có xác suất cao nhất (Greedy decoding)
             # mel_pred_ids: [1, Time, 16]

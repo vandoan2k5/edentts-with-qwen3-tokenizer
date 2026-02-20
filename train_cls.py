@@ -72,9 +72,9 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             # 3. Tính toán Loss (Sử dụng CrossEntropy cho mel_loss)
             mel_loss = mel_loss_func(mel_pred, m_target, mel_lens)
             dur_loss = duration_loss_func(log_dur_pred, log_dur_target, text_lens)
-            
+            attn_loss = guided_atten_loss_func(alpha, text_lens, mel_lens)
             # Cân bằng trọng số: CrossEntropy thường lớn hơn MSE, có thể để 1.0 thay vì 5.0
-            loss = dur_loss + mel_loss 
+            loss = dur_loss + mel_loss + attn_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -83,25 +83,46 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             # 4. Tính toán Stats và Accuracy (giống tư tưởng voxtream)
             stats = dict()
             with torch.no_grad():
-                # Tính độ chính xác của dự đoán Token
+                # Lấy mask cơ bản [Batch, Time] để lọc padding
                 valid_mask = ~get_mask_from_lengths(mel_lens, max_len=mel_pred.shape[1]).to(device)
-                valid_mask = valid_mask.unsqueeze(-1)
+                total_valid_frames = valid_mask.sum().item()
+                
+                if total_valid_frames > 0:
+                    # --- A. ACCURACY TẦNG 0 (Nội dung chính) ---
+                    # Lấy dự đoán và target của RIÊNG tầng đầu tiên (index 0)
+                    pred_ids_L0 = torch.argmax(mel_pred[:, :, 0, :], dim=-1) # [B, T]
+                    target_L0 = m_target[:, :, 0] # [B, T]
+                    
+                    correct_L0 = (pred_ids_L0[valid_mask] == target_L0[valid_mask]).sum().item()
+                    stats["acc_L0"] = correct_L0 / total_valid_frames
+                    
+                    # --- B. TOP-5 ACCURACY (Cho toàn bộ 16 tầng) ---
+                    # Lấy 5 giá trị có xác suất cao nhất: [B, T, 16, 5]
+                    _, top5_preds = torch.topk(mel_pred, k=5, dim=-1)
+                    
+                    # Mở rộng chiều target để so sánh: [B, T, 16, 1]
+                    target_expanded = m_target.unsqueeze(-1)
+                    
+                    # Kiểm tra target có nằm trong 5 dự đoán này không (trả về True/False) [B, T, 16]
+                    correct_top5 = (top5_preds == target_expanded).any(dim=-1)
+                    
+                    # Expand mask để đếm trên 16 tầng
+                    mask_16 = valid_mask.unsqueeze(-1).expand(-1, -1, 16)
+                    top5_correct = correct_top5[mask_16].sum().item()
+                    stats["top5"] = top5_correct / (total_valid_frames * 16)
 
-                pred_ids = torch.argmax(mel_pred, dim=-1)
-                mask_expanded = valid_mask.expand_as(pred_ids)
-
-                correct = (pred_ids[mask_expanded] == m_target[mask_expanded]).sum().item()
-                total = valid_mask.sum().item() * 16
-                accuracy = correct / total if total > 0 else 0.0
-                stats["acc"] = accuracy
+                    # --- C. ACCURACY CŨ (Exact match cho cả 16 tầng - để tham khảo) ---
+                    pred_ids_all = torch.argmax(mel_pred, dim=-1)
+                    correct_all = (pred_ids_all[mask_16] == m_target[mask_16]).sum().item()
+                    stats["acc"] = correct_all / (total_valid_frames * 16)
+                else:
+                    stats["acc_L0"], stats["top5"], stats["acc"] = 0.0, 0.0, 0.0
 
             ave_mel_loss += mel_loss.item()
-            stats["avemel"] = ave_mel_loss / i
             stats["mel"] = mel_loss.item()
             stats["dur"] = dur_loss.item()
+            stats["attn"] = attn_loss.item()
             running_loss += loss.item()
-            stats["aveloss"] = running_loss / i
-            stats["step"] = step
             stats["loss"] = loss.item()
             
             speed = i / (time.time() - start)

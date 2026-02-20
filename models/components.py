@@ -105,156 +105,93 @@ class TextEncoder(torch.nn.Module):
 
 
 class MelEncoder(torch.nn.Module):
-    def __init__(self, n_mels,
-                 n_channels,
-                 nonlinear_activation,
-                 nonlinear_activation_params,
-                 dropout_rate,
-                 n_mel_encoder_layer,
-                 k_size,
-                 use_weight_norm,
-                 dilations=None,
-                 vocab_size=2048): # Thêm vocab_size
+    def __init__(self, n_mels, n_channels, nonlinear_activation, nonlinear_activation_params,
+                 dropout_rate, n_mel_encoder_layer, k_size, use_weight_norm,
+                 dilations=None, vocab_size=2048):
         super().__init__()
-        
-        # 1. Thay Linear bằng Embedding để xử lý Token IDs
         self.embedding = torch.nn.Embedding(vocab_size, n_channels)
-        
-        # 2. ResConvBlock giữ nguyên
         self.mel_encoder = ResConvBlock(
-            num_layers=n_mel_encoder_layer,
-            n_channels=n_channels,
-            k_size=k_size,
+            num_layers=n_mel_encoder_layer, n_channels=n_channels, k_size=k_size,
             nonlinear_activation=nonlinear_activation,
             nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate,
-            use_weight_norm=use_weight_norm,
-            dilations=dilations
+            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dilations
         )
 
     def forward(self, speech):
-        # speech input có dạng: [Batch, Time, 16] (Token IDs nguyên bản)
+        # CẢI TIẾN 1: speech có dạng [Batch, Time, 16]
+        # Chỉ lấy Tầng 0 (chứa thông tin âm vị cốt lõi) để học Alignment, loại bỏ nhiễu
+        speech_layer_0 = speech[:, :, 0] 
         
-        # Nhúng các Token ID thành vector: [Batch, Time, 16, n_channels]
-        embedded = self.embedding(speech) 
-        
-        # Cộng dồn thông tin của 16 tầng RVQ lại: [Batch, Time, n_channels]
-        mel_h = embedded.sum(dim=2) 
-        
-        # Transpose để đưa qua mạng Conv: [Batch, n_channels, Time]
+        mel_h = self.embedding(speech_layer_0) # [Batch, Time, n_channels]
         mel_h = mel_h.transpose(1, 2) 
         mel_h = self.mel_encoder(mel_h)
         
-        # Trả về dạng ban đầu: [Batch, Time, n_channels]
         return mel_h.transpose(1, 2)
 
 
 class Decoder(torch.nn.Module):
-    def __init__(self,
-                 idim,
-                 encoder_hidden,
-                 n_decoder_layer,
-                 k_size,
-                 nonlinear_activation,
-                 nonlinear_activation_params,
-                 dropout_rate,
-                 use_weight_norm,
-                 n_mels,         # Số tầng codebook (16)
-                 vocab_size=2048, # Từ điển Qwen3
-                 dialations=None
-                 ):
+    def __init__(self, idim, encoder_hidden, n_decoder_layer, k_size,
+                 nonlinear_activation, nonlinear_activation_params,
+                 dropout_rate, use_weight_norm, n_mels, vocab_size=2048, dialations=None):
         super().__init__()
         self.n_mels = n_mels
         self.vocab_size = vocab_size
         
-        self.pre_linear = torch.nn.Linear(idim, encoder_hidden)
-        self.decoder = ResConvBlock(
-            num_layers=n_decoder_layer,
-            n_channels=encoder_hidden,
-            k_size=k_size,
+        # --- BƯỚC 1: COARSE DECODER (Dự đoán Tầng 0) ---
+        self.coarse_pre_linear = torch.nn.Linear(idim, encoder_hidden)
+        self.coarse_decoder = ResConvBlock(
+            num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
             nonlinear_activation=nonlinear_activation,
             nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate,
-            use_weight_norm=use_weight_norm,
-            dilations=dialations
+            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
         )
-        
-        # ĐẦU RA PHÂN LOẠI: Dự đoán 16 tầng * 2048 class
-        self.mel_output_layer = torch.nn.Linear(encoder_hidden, n_mels * vocab_size)
+        self.coarse_output = torch.nn.Linear(encoder_hidden, vocab_size)
 
-    def forward(self, text_value_expanded):
-        # text_value_expanded: [Batch, Time, idim]
-        x = self.pre_linear(text_value_expanded) 
-        
-        # Chuyển qua mạng ResConv (xử lý trên chiều Channels)
-        x = self.decoder(x.transpose(1, 2))
-        
-        # Chuyển về Logits: [Batch, Time, n_mels * vocab_size]
-        logits = self.mel_output_layer(x.transpose(1, 2))
-        
-        # RESHAPE THÀNH 4D: [Batch, Time, 16, 2048]
-        batch_size = logits.size(0)
-        time_steps = logits.size(1)
-        logits = logits.view(batch_size, time_steps, self.n_mels, self.vocab_size)
-        
-        return logits
-
-class RVQDecoder(torch.nn.Module):
-    def __init__(self,
-                 idim,
-                 encoder_hidden,
-                 n_decoder_layer,
-                 k_size,
-                 nonlinear_activation,
-                 nonlinear_activation_params,
-                 dropout_rate,
-                 use_weight_norm,
-                 n_mels,        # Đây là số lượng codebooks (ví dụ: 16)
-                 vocab_size=2048, # Kích thước từ điển của Qwen3
-                 dialations=None
-                 ):
-        super().__init__()
-        self.n_mels = n_mels
-        self.vocab_size = vocab_size
-        
-        self.pre_linear = torch.nn.Linear(idim, encoder_hidden)
-        self.decoder = ResConvBlock(
-            num_layers=n_decoder_layer,
-            n_channels=encoder_hidden,
-            k_size=k_size,
+        # --- BƯỚC 2: FINE DECODER (Dự đoán Tầng 1 đến 15) ---
+        self.layer0_emb = torch.nn.Embedding(vocab_size, encoder_hidden)
+        self.fine_pre_linear = torch.nn.Linear(idim, encoder_hidden)
+        self.fine_decoder = ResConvBlock(
+            num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
             nonlinear_activation=nonlinear_activation,
             nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate,
-            use_weight_norm=use_weight_norm,
-            dilations=dialations
+            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
         )
-        
-        # THAY ĐỔI CHÍNH: Lớp đầu ra dự đoán Logits cho từng token
-        # Output shape sẽ là: n_mels * vocab_size (16 * 2048)
-        self.mel_output_layer = torch.nn.Linear(encoder_hidden, n_mels * vocab_size)
+        self.fine_output = torch.nn.Linear(encoder_hidden, (n_mels - 1) * vocab_size)
 
-    def forward(self, text_value_expanded):
+    def forward(self, text_value_expanded, target_layer0=None):
         # text_value_expanded: [Batch, Time, idim]
-        x = self.pre_linear(text_value_expanded) 
         
-        # Decoder xử lý trên chiều [Batch, Channels, Time]
-        x = self.decoder(x.transpose(1, 2))
+        # 1. Dự đoán Tầng 0
+        x_coarse = self.coarse_pre_linear(text_value_expanded)
+        x_coarse = self.coarse_decoder(x_coarse.transpose(1, 2))
+        logits_coarse = self.coarse_output(x_coarse.transpose(1, 2)) # [B, Time, 2048]
         
-        # Quay lại [Batch, Time, encoder_hidden]
-        logits = self.mel_output_layer(x.transpose(1, 2))
+        # 2. Chuẩn bị thông tin Tầng 0 cho Decoder sau
+        if target_layer0 is not None:
+            # Training: Dùng "Teacher Forcing" bằng nhãn thật
+            layer0_tokens = target_layer0
+        else:
+            # Inference: Lấy kết quả vừa dự đoán
+            layer0_tokens = torch.argmax(logits_coarse, dim=-1)
+            
+        l0_emb = self.layer0_emb(layer0_tokens) # [B, Time, encoder_hidden]
         
-        # RESHAPE: Tách thành 16 bộ logits riêng biệt
-        # New shape: [Batch, Time, 16, 2048]
-        logits = logits.view(logits.size(0), logits.size(1), self.n_mels, self.vocab_size)
+        # 3. Dự đoán Tầng 1 đến 15 dựa trên (Text + Tầng 0)
+        x_fine = self.fine_pre_linear(text_value_expanded)
+        x_fine = x_fine + l0_emb # Ép sự phụ thuộc: Fine token phải khớp với Coarse token
+        
+        x_fine = self.fine_decoder(x_fine.transpose(1, 2))
+        logits_fine = self.fine_output(x_fine.transpose(1, 2)) # [B, Time, 15 * 2048]
+        
+        # 4. Gộp kết quả
+        B, T, _ = logits_fine.shape
+        logits_fine = logits_fine.view(B, T, self.n_mels - 1, self.vocab_size)
+        logits_coarse = logits_coarse.unsqueeze(2) # [B, Time, 1, 2048]
+        
+        # Output: [B, Time, 16, 2048]
+        logits = torch.cat([logits_coarse, logits_fine], dim=2)
         
         return logits
-
-    def inference(self, text_value_expanded):
-        logits = self.forward(text_value_expanded)
-        # Lấy Token ID có xác suất cao nhất (Greedy Search)
-        # Shape: [Batch, Time, 16]
-        token_ids = torch.argmax(logits, dim=-1)
-        return token_ids
 
 class DurationPredictor(nn.Module):
     """ Duration Predictor """
