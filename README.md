@@ -6,7 +6,7 @@ Hướng tiếp cận này mang mô hình tiến gần hơn đến các kiến t
 
 ## ✨ Những Cải Tiến Kiến Trúc Nổi Bật
 
-1. **Từ Liên Tục Sang Rời Rạc (Continuous to Discrete):** * Thay thế toàn bộ quá trình xử lý Mel-spectrogram bằng mảng Token IDs (Số nguyên từ 0 - 2047).
+1. **Từ Liên Tục Sang Rời Rạc (Continuous to Discrete):** Thay thế toàn bộ quá trình xử lý Mel-spectrogram bằng mảng Token IDs (Số nguyên từ 0 - 2047).
 * Tích hợp `nn.Embedding` để biểu diễn các Token IDs thành không gian liên tục bên trong mạng học đặc trưng.
 
 
