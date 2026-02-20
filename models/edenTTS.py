@@ -145,7 +145,7 @@ class EdenTTS(AbstractModel):
             )
             
             # mel_pred_logits: [1, Time, 16, 2048]
-            mel_pred_logits = self.decoder(text_value_expanded)
+            mel_pred_logits = self.decoder(text_value_expanded.transpose(1, 2))
             # mel_pred_logits = mel_pred_logits.view(1, -1, self.n_mels, self.vocab_size)
             
             # Lấy index có xác suất cao nhất (Greedy decoding)
