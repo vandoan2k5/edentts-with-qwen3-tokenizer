@@ -1,0 +1,17 @@
+[project]
+name = "eden-tts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "g2p-en>=2.1.0",
+    "ipykernel>=7.2.0",
+    "librosa>=0.11.0",
+    "matplotlib>=3.10.8",
+    "piper-phonemize>=1.1.0",
+    "torch>=2.10.0",
+    "torchcodec>=0.10.0",
+    "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
+]
