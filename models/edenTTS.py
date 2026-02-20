@@ -94,8 +94,8 @@ class EdenTTS(AbstractModel):
         
         # speech lúc này là Token IDs (Long) đã transpose thành (B, 16, T)
         # MelEncoder của bạn cần float, ta chuyển đổi tạm thời
-        speech_input = speech.float().transpose(1, 2)  # Chuyển thành [B, 16, Time]
-        mel_h = self.mel_encoder(speech_input)
+        # speech_input = speech.float().transpose(1, 2)  # Chuyển thành [B, 16, Time]
+        mel_h = self.mel_encoder(speech)
 
         alpha = scaled_dot_attention(key=text_key, key_lens=text_lengths, query=mel_h,
                                      query_lens=mel_lens, e_weight=e_weight)

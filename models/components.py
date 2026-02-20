@@ -113,14 +113,14 @@ class MelEncoder(torch.nn.Module):
                  n_mel_encoder_layer,
                  k_size,
                  use_weight_norm,
-                 dilations=None
-                 ):
+                 dilations=None,
+                 vocab_size=2048): # Thêm vocab_size
         super().__init__()
-        self.mel_prenet = torch.nn.Sequential(
-            torch.nn.Linear(n_mels, n_channels),
-            getattr(torch.nn, nonlinear_activation)(**nonlinear_activation_params),
-            torch.nn.Dropout(dropout_rate),
-        )
+        
+        # 1. Thay Linear bằng Embedding để xử lý Token IDs
+        self.embedding = torch.nn.Embedding(vocab_size, n_channels)
+        
+        # 2. ResConvBlock giữ nguyên
         self.mel_encoder = ResConvBlock(
             num_layers=n_mel_encoder_layer,
             n_channels=n_channels,
@@ -133,9 +133,20 @@ class MelEncoder(torch.nn.Module):
         )
 
     def forward(self, speech):
-        mel_h = self.mel_prenet(speech).transpose(1, 2)
-        mel_h = self.mel_encoder(mel_h).transpose(1, 2)
-        return mel_h
+        # speech input có dạng: [Batch, Time, 16] (Token IDs nguyên bản)
+        
+        # Nhúng các Token ID thành vector: [Batch, Time, 16, n_channels]
+        embedded = self.embedding(speech) 
+        
+        # Cộng dồn thông tin của 16 tầng RVQ lại: [Batch, Time, n_channels]
+        mel_h = embedded.sum(dim=2) 
+        
+        # Transpose để đưa qua mạng Conv: [Batch, n_channels, Time]
+        mel_h = mel_h.transpose(1, 2) 
+        mel_h = self.mel_encoder(mel_h)
+        
+        # Trả về dạng ban đầu: [Batch, Time, n_channels]
+        return mel_h.transpose(1, 2)
 
 
 class Decoder(torch.nn.Module):

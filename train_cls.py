@@ -63,7 +63,7 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             # m_target = m_target.transpose(1, 2) # [Batch, Time, 16]
 
             # 2. Forward model (nhận về mel_pred là Logits [B, T, 16, 2048])
-            outputs = model(phones, text_lens, m, mel_lens, e_mask)
+            outputs = model(phones, text_lens, m_target, mel_lens, e_mask)
             step = model.get_step()
             
             # Bóc tách output (EdenTTS mới trả về 5 giá trị)
@@ -85,10 +85,14 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             with torch.no_grad():
                 # Tính độ chính xác của dự đoán Token
                 valid_mask = ~get_mask_from_lengths(mel_lens, max_len=mel_pred.shape[1]).to(device)
+                valid_mask = valid_mask.unsqueeze(-1)
+
                 pred_ids = torch.argmax(mel_pred, dim=-1)
-                correct = (pred_ids[valid_mask] == m_target[valid_mask]).sum().item()
-                total = m_target[valid_mask].numel()
-                accuracy = correct / total
+                mask_expanded = valid_mask.expand_as(pred_ids)
+
+                correct = (pred_ids[mask_expanded] == m_target[mask_expanded]).sum().item()
+                total = valid_mask.sum().item() * 16
+                accuracy = correct / total if total > 0 else 0.0
                 stats["acc"] = accuracy
 
             ave_mel_loss += mel_loss.item()
