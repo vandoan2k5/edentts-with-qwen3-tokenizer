@@ -19,14 +19,14 @@ class Hparams(object):
         self.voc_path = r"C:\Users\home\Desktop\hifigan\pretrained\lj_wo_ft.pth.tar"
         self.vocab_size = 365  # number of input tokens
         # Training
-        self.tts_max_steps = 300_000  # you may stop at around 100_000 for ljspeech dataset for acceptable speech quality
-        self.tts_max_mel_len = 1500
+        self.tts_max_steps = 100_000  # you may stop at around 100_000 for ljspeech dataset for acceptable speech quality
+        self.tts_max_mel_len = 400
         self.tts_bin_lengths = True   # bins the spectrogram lengths before sampling in data loader - speeds up training
         self.tts_checkpoint_every = 400_00  # checkpoints the model every X steps
         self.tts_show_info_every = 2   # print tran status every X steps
         self.tts_eval_every = 30
         self.lr = 1e-4
-        self.batch_size = 96
+        self.batch_size = 128
 
         # token type, can be char or phonemes,
         # we use char in our article
@@ -73,8 +73,8 @@ class Hparams(object):
         self.sample_rate = 22050
         self.n_fft = 1024
         self.fft_bins = self.n_fft // 2 + 1
-        self.num_mels = 80
-        self.hop_length = 256 # 12.5ms - in line with Tacotron 2 paper
+        self.num_mels = 16
+        self.hop_length = 1764 # 12.5ms - in line with Tacotron 2 paper
         self.win_length = 1024   # 50ms - same reason as above
         self.fmin = 0
         self.fmax = 8000

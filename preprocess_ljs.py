@@ -3,8 +3,8 @@
 @email: edenmyn
 @time: 2022/10/1 10:00
 @DESC: 
-
 """
+import multiprocessing
 from utils.display import *
 from utils.dsp import *
 from utils import hparams as hp
@@ -16,17 +16,25 @@ from utils.files import get_files
 from pathlib import Path
 import argparse
 from energy_weight_processor import prepare_energy_weight
-
+import soundfile as sf
+from qwen_tts import Qwen3TTSTokenizer
 
 paths = Paths(hp.data_path, speaker="ljs")
 
+tokenizer = Qwen3TTSTokenizer.from_pretrained(
+    "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    device_map="cuda:0",
+)
 
 def convert_file(path: Path):
     y = load_wav(path)
     print(f"Loaded {path} with shape {y.shape} and sample rate {hp.sample_rate}")
     peak = np.abs(y).max()
     y /= peak
-    mel = melspectrogram(y, np=True)
+    enc = tokenizer.encode(str(path))
+    mel = enc[0][0].T.cpu().numpy()
+    # new_enc = enc[0][0].float()/2048
+    # mel = new_enc.T.cpu().numpy()
     print(f"Computed mel spectrogram with shape {mel.shape}")
     quant = float_2_label(y, bits=16)
     print(f"Quantized audio to shape {quant.shape} with {hp.bits} bits")
@@ -97,6 +105,7 @@ def main(wav_path, n_workers=4):
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True)
     # make sure the speaker is "ljs" if dataset "LJSpeech"
     assert hp.speaker == "ljs"
     # set the path to the LJSpeech dataset
@@ -104,8 +113,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-p", "--wav_path", type=str, required=False, help="path to ljspeech dataset"
     )
-    parser.add_argument("-n", "--n_workers", type=int, default=4)
+    parser.add_argument("-n", "--n_workers", type=int, default=1)
     args = parser.parse_args()
-    args.wav_path = r"/kaggle/eden_tts/LJSpeech-1.1"
+    args.wav_path = r"./LJSpeech-1.1"
     main(args.wav_path, n_workers=args.n_workers)
 

@@ -16,3 +16,4 @@ LJSpeech-1.1.tar.bz2
 *.png
 *.wav
 data/
+checkpoints/

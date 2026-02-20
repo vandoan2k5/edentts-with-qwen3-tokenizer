@@ -138,7 +138,7 @@ class MelEncoder(torch.nn.Module):
         return mel_h
 
 
-class Decocer(torch.nn.Module):
+class Decoder(torch.nn.Module):
     def __init__(self,
                  idim,
                  encoder_hidden,
@@ -148,10 +148,14 @@ class Decocer(torch.nn.Module):
                  nonlinear_activation_params,
                  dropout_rate,
                  use_weight_norm,
-                 n_mels,
+                 n_mels,         # Số tầng codebook (16)
+                 vocab_size=2048, # Từ điển Qwen3
                  dialations=None
                  ):
         super().__init__()
+        self.n_mels = n_mels
+        self.vocab_size = vocab_size
+        
         self.pre_linear = torch.nn.Linear(idim, encoder_hidden)
         self.decoder = ResConvBlock(
             num_layers=n_decoder_layer,
@@ -163,14 +167,83 @@ class Decocer(torch.nn.Module):
             use_weight_norm=use_weight_norm,
             dilations=dialations
         )
-        self.mel_output_layer = torch.nn.Linear(encoder_hidden, n_mels)
+        
+        # ĐẦU RA PHÂN LOẠI: Dự đoán 16 tầng * 2048 class
+        self.mel_output_layer = torch.nn.Linear(encoder_hidden, n_mels * vocab_size)
 
     def forward(self, text_value_expanded):
-        x = self.pre_linear(text_value_expanded.transpose(1, 2))
-        mel_pred = self.decoder(x.transpose(1, 2))
-        mel_pred = self.mel_output_layer(mel_pred.transpose(1, 2))
-        return mel_pred
+        # text_value_expanded: [Batch, Time, idim]
+        x = self.pre_linear(text_value_expanded) 
+        
+        # Chuyển qua mạng ResConv (xử lý trên chiều Channels)
+        x = self.decoder(x.transpose(1, 2))
+        
+        # Chuyển về Logits: [Batch, Time, n_mels * vocab_size]
+        logits = self.mel_output_layer(x.transpose(1, 2))
+        
+        # RESHAPE THÀNH 4D: [Batch, Time, 16, 2048]
+        batch_size = logits.size(0)
+        time_steps = logits.size(1)
+        logits = logits.view(batch_size, time_steps, self.n_mels, self.vocab_size)
+        
+        return logits
 
+class RVQDecoder(torch.nn.Module):
+    def __init__(self,
+                 idim,
+                 encoder_hidden,
+                 n_decoder_layer,
+                 k_size,
+                 nonlinear_activation,
+                 nonlinear_activation_params,
+                 dropout_rate,
+                 use_weight_norm,
+                 n_mels,        # Đây là số lượng codebooks (ví dụ: 16)
+                 vocab_size=2048, # Kích thước từ điển của Qwen3
+                 dialations=None
+                 ):
+        super().__init__()
+        self.n_mels = n_mels
+        self.vocab_size = vocab_size
+        
+        self.pre_linear = torch.nn.Linear(idim, encoder_hidden)
+        self.decoder = ResConvBlock(
+            num_layers=n_decoder_layer,
+            n_channels=encoder_hidden,
+            k_size=k_size,
+            nonlinear_activation=nonlinear_activation,
+            nonlinear_activation_params=nonlinear_activation_params,
+            dropout_rate=dropout_rate,
+            use_weight_norm=use_weight_norm,
+            dilations=dialations
+        )
+        
+        # THAY ĐỔI CHÍNH: Lớp đầu ra dự đoán Logits cho từng token
+        # Output shape sẽ là: n_mels * vocab_size (16 * 2048)
+        self.mel_output_layer = torch.nn.Linear(encoder_hidden, n_mels * vocab_size)
+
+    def forward(self, text_value_expanded):
+        # text_value_expanded: [Batch, Time, idim]
+        x = self.pre_linear(text_value_expanded) 
+        
+        # Decoder xử lý trên chiều [Batch, Channels, Time]
+        x = self.decoder(x.transpose(1, 2))
+        
+        # Quay lại [Batch, Time, encoder_hidden]
+        logits = self.mel_output_layer(x.transpose(1, 2))
+        
+        # RESHAPE: Tách thành 16 bộ logits riêng biệt
+        # New shape: [Batch, Time, 16, 2048]
+        logits = logits.view(logits.size(0), logits.size(1), self.n_mels, self.vocab_size)
+        
+        return logits
+
+    def inference(self, text_value_expanded):
+        logits = self.forward(text_value_expanded)
+        # Lấy Token ID có xác suất cao nhất (Greedy Search)
+        # Shape: [Batch, Time, 16]
+        token_ids = torch.argmax(logits, dim=-1)
+        return token_ids
 
 class DurationPredictor(nn.Module):
     """ Duration Predictor """

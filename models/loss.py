@@ -34,13 +34,25 @@ def pe_loss_func(d_pred, d_target, ilens):
     return F.mse_loss(d_outs, ds)
 
 
-def mel_loss_func(mel_pred, mel_target, mel_lens):
+def mel_loss_func(logits, targets, mel_lens):
     """
-    mel_pred: B, L, n_mels
+    logits: [Batch, Time, 16, 2048] - Đầu ra từ Decoder mới
+    targets: [Batch, Time, 16] - Token IDs nguyên bản (0-2047)
+    mel_lens: [Batch] - Độ dài thực của từng câu
     """
-    mel_masks = ~get_mask_from_lengths(mel_lens, max_len=mel_pred.shape[1]).to(mel_pred.device)
-    mel_target = mel_target[:, :mel_masks.shape[1], :]
-    mel_target.requires_grad = False
-    mel_target = mel_target.masked_select(mel_masks.unsqueeze(-1))
-    mel_pred = mel_pred.masked_select(mel_masks.unsqueeze(-1))
-    return F.mse_loss(mel_pred, mel_target)
+    # 1. Tạo mask để loại bỏ phần padding (giống code cũ của bạn)
+    mel_masks = ~get_mask_from_lengths(mel_lens, max_len=logits.shape[1]).to(logits.device)
+    
+    # 2. Lọc lấy các giá trị không phải padding
+    # logits[mel_masks] sẽ có shape [Tổng_số_frame_thực, 16, 2048]
+    # targets[mel_masks] sẽ có shape [Tổng_số_frame_thực, 16]
+    valid_logits = logits[mel_masks] 
+    valid_targets = targets[mel_masks]
+    
+    # 3. Tính Cross Entropy cho toàn bộ 16 tầng RVQ cùng lúc
+    # Ta flatten chiều thời gian và chiều 16 tầng để tính cho nhanh
+    return F.cross_entropy(
+        valid_logits.view(-1, 2048), 
+        valid_targets.view(-1).long(),
+        label_smoothing=0.1 # Gợi ý: Thêm chút smoothing để mô hình mượt hơn
+    )

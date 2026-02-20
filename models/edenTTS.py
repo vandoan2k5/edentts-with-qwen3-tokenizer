@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# edenmyn 2022/09/22
+# edenmyn 2022/09/22 -> Modified for Classification 2026/02/20
 
-from typing import Dict
-from typing import Tuple
+import torch
+import torch.nn as nn
+from typing import Dict, Tuple
 from models.abtract_model import AbstractModel
 from .components import *
 from utils.net_utils import parameter_count, make_non_pad_mask
-from models.modules import PostNet
 from hparams import Hparams
+from utils.log_util import get_logger
 
 logging = get_logger(__name__)
-
 
 class EdenTTS(AbstractModel):
     def __init__(
@@ -25,6 +25,8 @@ class EdenTTS(AbstractModel):
         super().__init__()
         self.duration_offset = duration_offset
         self.delta = h.delta
+        self.n_mels = h.num_mels  # Thường là 16 tầng Codebook
+        self.vocab_size = 2048    # Kích thước từ điển của Qwen3
 
         self.text_encoder = TextEncoder(n_channels=h.n_channels,
                                         encoder_layer=h.text_encoder_layers,
@@ -49,7 +51,8 @@ class EdenTTS(AbstractModel):
             dropout=h.duration_predicotr_dropout
         )
 
-        self.decoder = Decocer(idim=h.n_channels,
+        # LƯU Ý: Lớp Decoder bây giờ sẽ khởi tạo mel_output_layer với kích thước (16 * 2048)
+        self.decoder = Decoder(idim=h.n_channels,
                                encoder_hidden=h.decoder_hidden,
                                n_decoder_layer=h.decoder_layers,
                                k_size=h.decoder_ksize,
@@ -57,13 +60,13 @@ class EdenTTS(AbstractModel):
                                nonlinear_activation_params=nonlinear_activation_params,
                                dropout_rate=h.decoder_dropout,
                                use_weight_norm=use_weight_norm,
-                               n_mels=h.num_mels,
+                               n_mels=h.num_mels,  # Truyền vào 16
                                dialations=h.decoder_dilation)
 
-        if h.use_postnet:
-            self.postnet = PostNet()
-        else:
-            self.postnet = None
+        # Trong cơ chế Classification của Audio Token, PostNet thường không còn cần thiết.
+        # Chúng ta gán bằng None để tránh lỗi Shape Mismatch 80-16.
+        self.postnet = None
+
         te = parameter_count(self.text_encoder)
         de = parameter_count(self.decoder)
         du = parameter_count(self.duration_predictor)
@@ -80,25 +83,23 @@ class EdenTTS(AbstractModel):
         speech: torch.Tensor,
         mel_lens: torch.Tensor,
         e_weight=None
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Forward propagations.
-        Args:
-            text: Batch of padded text ids (B, T1).
-            text_lengths: Batch of lengths of each input batch (B,).
-            speech: Batch of mel-spectrograms (B, T2, num_mels)
-            mel_lens: Batch of mel-spectrogram lengths (B,)
-            e_weight: energy weight (B, T1, T2)
-        """
+    ) -> Tuple:
         if self.training:
             self.step += 1
+        
         device = phone_ids.device
         mel_mask = ~make_non_pad_mask(mel_lens).to(device)
+        
         text_key, text_value = self.text_encoder(phone_ids, text_lengths)
-        speech = speech.transpose(1, 2)
-        mel_h = self.mel_encoder(speech)
+        
+        # speech lúc này là Token IDs (Long) đã transpose thành (B, 16, T)
+        # MelEncoder của bạn cần float, ta chuyển đổi tạm thời
+        speech_input = speech.float().transpose(1, 2)  # Chuyển thành [B, 16, Time]
+        mel_h = self.mel_encoder(speech_input)
 
         alpha = scaled_dot_attention(key=text_key, key_lens=text_lengths, query=mel_h,
                                      query_lens=mel_lens, e_weight=e_weight)
+        
         dur0 = torch.sum(alpha, dim=-1)
         e = torch.cumsum(dur0, dim=-1)
         e = e - dur0/2
@@ -114,12 +115,12 @@ class EdenTTS(AbstractModel):
         )
         _tmp_mask_2 = mel_mask.unsqueeze(1).repeat(1, text_value.size(2), 1)
         text_value_expanded = text_value_expanded.masked_fill(_tmp_mask_2, 0.0)
-        mel_pred = self.decoder(text_value_expanded)
-        if self.postnet is not None:
-            mel_pred_post = self.postnet(mel_pred)
-            return log_dur_pred, log_dur_target, mel_pred, mel_pred_post, alpha, reconst_alpha
-        else:
-            return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
+        
+        # mel_pred lúc này là Logits có shape: [B, Time, 16, 2048]
+        mel_pred = self.decoder(text_value_expanded.transpose(1, 2))
+        
+        # Trả về các thành phần phục vụ tính CrossEntropy Loss
+        return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
 
     def inference(
         self,
@@ -127,29 +128,30 @@ class EdenTTS(AbstractModel):
         delta=None,
         d_control=1
     ):
-        """Inference.
-        Args:
-            phone_ids: Batch of padded text ids (1, T1).
-            d_control: duration adjust parameter to control synthesis speed
-            delta: hperparmeter usd to reconstuct monotonic alignment from durations
-        """
         if delta is None:
             delta = self.delta
         self.eval()
         with torch.no_grad():
             text_value = self.text_encoder.inference(phone_ids)
             dur = self.duration_predictor.inference(text_value)*d_control
+            
             if torch.sum(dur)/dur.size(0) < 1:
                 dur = 4*torch.ones_like(dur)
-                logging.warn("predict too short duration, use dummy ones")
+                logging.warning("predict too short duration, use dummy ones")
+                
             e = torch.cumsum(dur, dim=1) - dur/2
             alpha = reconstruct_align_from_aligned_position(e, mel_lens=None, text_lens=None, delta=delta)
+            
             text_value_expanded = torch.bmm(
                 text_value.transpose(1, 2), alpha
             )
-            mel_pred = self.decoder(text_value_expanded)
-            if self.postnet is not None:
-                mel_pred = self.postnet(mel_pred)
+            
+            # mel_pred_logits: [1, Time, 16, 2048]
+            mel_pred_logits = self.decoder(text_value_expanded)
+            
+            # Lấy index có xác suất cao nhất (Greedy decoding)
+            # mel_pred_ids: [1, Time, 16]
+            mel_pred_ids = torch.argmax(mel_pred_logits, dim=-1)
+            
         self.train()
-        return mel_pred
-
+        return mel_pred_ids
