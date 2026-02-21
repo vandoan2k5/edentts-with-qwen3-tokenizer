@@ -106,21 +106,6 @@ class LayerNorm(torch.nn.LayerNorm):
             return super().forward(x.transpose(1, -1)).transpose(1, -1)
 
 
-class CausalConv1d(torch.nn.Conv1d):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, 
-                 dilation=1, groups=1, bias=True, padding=0): # Thêm padding vào đây
-        # Luôn ép padding bằng 0 vì chúng ta sẽ pad thủ công để tạo tính nhân quả
-        super(CausalConv1d, self).__init__(
-            in_channels, out_channels, kernel_size, 
-            stride=stride, padding=0, dilation=dilation, 
-            groups=groups, bias=bias)
-        self.causal_padding = (kernel_size - 1) * dilation
-
-    def forward(self, x):
-        # x: [B, C, T]
-        x = torch.nn.functional.pad(x, (self.causal_padding, 0))
-        return super(CausalConv1d, self).forward(x)
-
 class Conv1d(torch.nn.Conv1d):
     """Conv1d module with customized initialization."""
 
@@ -135,8 +120,9 @@ class Conv1d(torch.nn.Conv1d):
             torch.nn.init.constant_(self.bias, 0.0)
 
 
-# Cập nhật trong models/layers.py
 class ResConv1d(torch.nn.Module):
+    """Residual Conv1d layer"""
+
     def __init__(
             self,
             n_channels=512,
@@ -144,30 +130,37 @@ class ResConv1d(torch.nn.Module):
             nonlinear_activation="LeakyReLU",
             nonlinear_activation_params={"negative_slope": 0.1},
             dropout_rate=0.1,
-            dilation=1,
-            causal=False  # Thêm flag causal
+            dilation=1
     ):
         super().__init__()
-        # Chọn loại Conv dựa trên flag causal
-        conv_layer = CausalConv1d if causal else torch.nn.Conv1d
-        padding = 0 if causal else (k_size - 1) // 2 # Causal tự xử lý padding nội bộ
-        
-        self.conv = torch.nn.Sequential(
-            conv_layer(
-                n_channels, n_channels,
-                kernel_size=k_size, 
-                padding=padding,
-                dilation=dilation
-            ),
-            getattr(torch.nn, nonlinear_activation)(**nonlinear_activation_params),
-            torch.nn.Dropout(dropout_rate) if dropout_rate >= 1e-5 else torch.nn.Identity(),
-        )
+        if dropout_rate < 1e-5:
+            self.conv = torch.nn.Sequential(
+                torch.nn.Conv1d(
+                    n_channels, n_channels,
+                    kernel_size=k_size, padding=(k_size - 1) // 2,
+                ),
+                getattr(torch.nn, nonlinear_activation)(**nonlinear_activation_params),
+            )
+        else:
+            self.conv = torch.nn.Sequential(
+                torch.nn.Conv1d(
+                    n_channels, n_channels,
+                    kernel_size=k_size, padding=get_padding(kernel_size=k_size, dilation=dilation),
+                    dilation=dilation
+                ),
+                getattr(torch.nn, nonlinear_activation)(**nonlinear_activation_params),
+                torch.nn.Dropout(dropout_rate),
+            )
 
     def forward(self, x):
-        return x + self.conv(x)
+        # x [B, C, T]
+        x = x + self.conv(x)
+        return x
 
 
 class ResConvBlock(torch.nn.Module):
+    """Block containing several ResConv1d layers."""
+
     def __init__(
             self,
             num_layers,
@@ -177,22 +170,24 @@ class ResConvBlock(torch.nn.Module):
             nonlinear_activation_params={"negative_slope": 0.1},
             dropout_rate=0.1,
             use_weight_norm=True,
-            dilations=None,
-            causal=False # ĐỔI THÀNH FALSE để không ảnh hưởng Encoder
+            dilations=None
     ):
         super().__init__()
         self.num_layers = num_layers
-        
-        # Nếu dilations không được truyền vào, tạo danh sách các giá trị 1 (no dilation)
-        actual_dilations = dilations if dilations is not None else [1] * num_layers
-        blocks = []
-        for d in actual_dilations:
-            blocks.append(ResConv1d(n_channels, k_size,
-                                    nonlinear_activation,
-                                    nonlinear_activation_params,
-                                    dropout_rate, d, causal=causal))
-        self.layers = torch.nn.Sequential(*blocks)
-        
+        if dilations is not None:
+            blocks = []
+            for i, dialation in enumerate(dilations):
+                blocks.append(ResConv1d(n_channels, k_size,
+                                        nonlinear_activation,
+                                        nonlinear_activation_params,
+                                        dropout_rate, dialation))
+            self.layers = torch.nn.Sequential(*blocks)
+        else:
+            self.layers = torch.nn.Sequential(*[
+                ResConv1d(n_channels, k_size, nonlinear_activation,
+                          nonlinear_activation_params, dropout_rate) \
+                for _ in range(num_layers)
+            ])
         if use_weight_norm:
             self.apply_weight_norm()
 

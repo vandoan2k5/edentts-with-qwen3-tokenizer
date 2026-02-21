@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 from utils.paths import Paths
 from models.edenTTS import EdenTTS
 import time
-import wandb
 from utils.display import stats_str, save_stats
 from utils.checkpoints import save_checkpoint, restore_checkpoint
 from utils.log_util import get_logger
@@ -39,7 +38,7 @@ def main():
     log.info('\n\n training completed!')
 
 def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr, train_steps, attn_example):
-    wandb_run = wandb.init(project="eden-tts-with-qwen3-tokenizer", config=vars(hp))
+
     device = next(model.parameters()).device 
     for g in optimizer.param_groups: g['lr'] = lr
 
@@ -125,17 +124,6 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             stats["attn"] = attn_loss.item()
             running_loss += loss.item()
             stats["loss"] = loss.item()
-            wandb_run.log(
-                {
-                    "loss": loss.item(),
-                    "mel_loss": mel_loss.item(),
-                    "dur_loss": dur_loss.item(),
-                    "attn_loss": attn_loss.item(),
-                    "acc_L0": stats["acc_L0"],
-                    "top5_acc": stats["top5"],
-                    "acc_all": stats["acc"]
-                }
-            )
             
             speed = i / (time.time() - start)
             save_stats(stats, paths, step)

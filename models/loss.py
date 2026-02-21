@@ -60,7 +60,7 @@ def mel_loss_func(logits, targets, mel_lens):
     loss_per_layer = loss_per_token.view(-1, 16)
     
     # 4. Tạo bộ trọng số giảm dần cho 16 tầng (Tầng 1 quan trọng nhất)
-    weights = torch.tensor([1 + 0.5**i  if i < 3 else 0.9**i for i in range(16)], device=logits.device)
+    weights = torch.tensor([0.9 ** i for i in range(16)], device=logits.device)
     
     # 5. Nhân trọng số và tính trung bình
     weighted_loss = loss_per_layer * weights

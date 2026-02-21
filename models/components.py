@@ -12,7 +12,7 @@ from models.layers import TokenEmbedding
 from transformer.Models import get_sinusoid_encoding_table
 from collections import OrderedDict
 from models.modules import Conv, Linear
-import torch.nn.functional as F
+
 
 class TextEncoder(torch.nn.Module):
     """
@@ -129,8 +129,6 @@ class MelEncoder(torch.nn.Module):
         return mel_h.transpose(1, 2)
 
 
-
-
 class Decoder(torch.nn.Module):
     def __init__(self, idim, encoder_hidden, n_decoder_layer, k_size,
                  nonlinear_activation, nonlinear_activation_params,
@@ -139,79 +137,58 @@ class Decoder(torch.nn.Module):
         self.n_mels = n_mels
         self.vocab_size = vocab_size
         
-        # --- THÊM: Embedding cho frame phía trước (t-1) ---
-        # Chúng ta dùng Tầng 0 (Coarse) của frame trước để điều kiện hóa frame hiện tại
-        self.prev_token_emb = torch.nn.Embedding(vocab_size, idim)
-
         # --- BƯỚC 1: COARSE DECODER (Dự đoán Tầng 0) ---
         self.coarse_pre_linear = torch.nn.Linear(idim, encoder_hidden)
         self.coarse_decoder = ResConvBlock(
             num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
             nonlinear_activation=nonlinear_activation,
             nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, 
-            dilations=dialations,
-            causal=True  # BẮT BUỘC: Phải dùng Causal Conv
+            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
         )
         self.coarse_output = torch.nn.Linear(encoder_hidden, vocab_size)
 
         # --- BƯỚC 2: FINE DECODER (Dự đoán Tầng 1 đến 15) ---
-        # Giữ nguyên logic Fine Decoder phụ thuộc vào Coarse của cùng frame t
         self.layer0_emb = torch.nn.Embedding(vocab_size, encoder_hidden)
         self.fine_pre_linear = torch.nn.Linear(idim, encoder_hidden)
         self.fine_decoder = ResConvBlock(
             num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
             nonlinear_activation=nonlinear_activation,
             nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, 
-            dilations=dialations,
-            causal=True # BẮT BUỘC: Phải dùng Causal Conv
+            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
         )
         self.fine_output = torch.nn.Linear(encoder_hidden, (n_mels - 1) * vocab_size)
 
     def forward(self, text_value_expanded, target_layer0=None):
-        # text_value_expanded: [Batch, Time, idim] (Thông tin từ Text Encoder đã align)
-        # target_layer0: [Batch, Time] (Nhãn thật của Tầng 0)
+        # text_value_expanded: [Batch, Time, idim]
         
-        # --- BƯỚC CHUẨN BỊ ĐIỀU KIỆN T-1 (Autoregressive Input) ---
-        if target_layer0 is not None:
-            # Training: Dịch chuyển nhãn thật sang phải 1 step (Teacher Forcing)
-            # Frame 0 sẽ nhận token "0" (hoặc padding token) làm điều kiện t-1
-            prev_tokens = F.pad(target_layer0[:, :-1], (1, 0), value=0)
-            x_prev_cond = self.prev_token_emb(prev_tokens)
-        else:
-            # Inference: Trong thực tế bạn sẽ cần một vòng lặp để dự đoán từng step
-            # Hoặc khởi tạo bằng 0 cho toàn bộ sequence nếu chạy parallel causal
-            x_prev_cond = torch.zeros_like(text_value_expanded)
-
-        # Kết hợp thông tin Text (t) và Audio Token (t-1)
-        # Điều này giúp dự đoán tại t phụ thuộc vào cả nội dung văn bản và âm thanh trước đó
-        x_input = text_value_expanded + x_prev_cond 
-
-        # 1. Dự đoán Tầng 0 (Coarse)
-        x_coarse = self.coarse_pre_linear(x_input)
+        # 1. Dự đoán Tầng 0
+        x_coarse = self.coarse_pre_linear(text_value_expanded)
         x_coarse = self.coarse_decoder(x_coarse.transpose(1, 2))
         logits_coarse = self.coarse_output(x_coarse.transpose(1, 2)) # [B, Time, 2048]
         
-        # 2. Chuẩn bị thông tin Tầng 0 cho Fine Decoder (cùng frame t)
+        # 2. Chuẩn bị thông tin Tầng 0 cho Decoder sau
         if target_layer0 is not None:
+            # Training: Dùng "Teacher Forcing" bằng nhãn thật
             layer0_tokens = target_layer0
         else:
+            # Inference: Lấy kết quả vừa dự đoán
             layer0_tokens = torch.argmax(logits_coarse, dim=-1)
             
-        l0_emb = self.layer0_emb(layer0_tokens) 
+        l0_emb = self.layer0_emb(layer0_tokens) # [B, Time, encoder_hidden]
         
-        # 3. Dự đoán Tầng 1 đến 15
-        x_fine = self.fine_pre_linear(x_input) # Cũng dùng x_input có chứa t-1
-        x_fine = x_fine + l0_emb # Phụ thuộc vào Tầng 0 hiện tại
+        # 3. Dự đoán Tầng 1 đến 15 dựa trên (Text + Tầng 0)
+        x_fine = self.fine_pre_linear(text_value_expanded)
+        x_fine = x_fine + l0_emb # Ép sự phụ thuộc: Fine token phải khớp với Coarse token
         
         x_fine = self.fine_decoder(x_fine.transpose(1, 2))
-        logits_fine = self.fine_output(x_fine.transpose(1, 2))
+        logits_fine = self.fine_output(x_fine.transpose(1, 2)) # [B, Time, 15 * 2048]
         
         # 4. Gộp kết quả
         B, T, _ = logits_fine.shape
         logits_fine = logits_fine.view(B, T, self.n_mels - 1, self.vocab_size)
-        logits_coarse = logits_coarse.unsqueeze(2) 
+        logits_coarse = logits_coarse.unsqueeze(2) # [B, Time, 1, 2048]
+        
+        # Output: [B, Time, 16, 2048]
         logits = torch.cat([logits_coarse, logits_fine], dim=2)
         
         return logits

@@ -12,11 +12,9 @@ dependencies = [
     "piper-phonemize>=1.1.0",
     "qwen-tts>=0.1.1",
     "setuptools>=82.0.0",
-    "soundfile>=0.13.1",
     "torch>=2.10.0",
     "torchcodec>=0.10.0",
     "torchvision>=0.25.0",
     "tqdm>=4.67.3",
     "unidecode>=1.4.0",
-    "wandb>=0.25.0",
 ]
