@@ -147,8 +147,7 @@ class Decoder(torch.nn.Module):
         )
         self.coarse_output = torch.nn.Linear(encoder_hidden, vocab_size)
 
-        # --- BƯỚC 2: FINE DECODER (Dự đoán Tầng 1 đến 15) ---
-        self.layer0_emb = torch.nn.Embedding(vocab_size, encoder_hidden)
+        # --- BƯỚC 2: CASCADED FINE DECODER ---
         self.fine_pre_linear = torch.nn.Linear(idim, encoder_hidden)
         self.fine_decoder = ResConvBlock(
             num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
@@ -156,41 +155,55 @@ class Decoder(torch.nn.Module):
             nonlinear_activation_params=nonlinear_activation_params,
             dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
         )
-        self.fine_output = torch.nn.Linear(encoder_hidden, (n_mels - 1) * vocab_size)
-
-    def forward(self, text_value_expanded, target_layer0=None):
-        # text_value_expanded: [Batch, Time, idim]
         
-        # 1. Dự đoán Tầng 0
+        # MỘI TẦNG SỬ DỤNG EMBEDDING VÀ OUTPUT HEAD RIÊNG BIỆT
+        self.layer_embs = nn.ModuleList([
+            torch.nn.Embedding(vocab_size, encoder_hidden) for _ in range(n_mels)
+        ])
+        
+        self.fine_outputs = nn.ModuleList([
+            torch.nn.Linear(encoder_hidden, vocab_size) for _ in range(n_mels - 1)
+        ])
+
+    def forward(self, text_value_expanded, targets=None):
+        # 1. Dự đoán Tầng 0 (Coarse)
         x_coarse = self.coarse_pre_linear(text_value_expanded)
         x_coarse = self.coarse_decoder(x_coarse.transpose(1, 2))
         logits_coarse = self.coarse_output(x_coarse.transpose(1, 2)) # [B, Time, 2048]
         
-        # 2. Chuẩn bị thông tin Tầng 0 cho Decoder sau
-        if target_layer0 is not None:
-            # Training: Dùng "Teacher Forcing" bằng nhãn thật
-            layer0_tokens = target_layer0
+        logits_list = [logits_coarse.unsqueeze(2)]
+        
+        # 2. Dự đoán Tầng 1 đến 15 (Cascaded)
+        # Khởi tạo hidden state ban đầu bằng Text Content
+        current_hidden = self.fine_pre_linear(text_value_expanded)
+        
+        # Xác định token khởi nguồn (Tầng 0)
+        if targets is not None:
+            current_tokens = targets[:, :, 0] # Training: Dùng nhãn thật (Teacher Forcing)
         else:
-            # Inference: Lấy kết quả vừa dự đoán
-            layer0_tokens = torch.argmax(logits_coarse, dim=-1)
+            current_tokens = torch.argmax(logits_coarse, dim=-1) # Inference: Dùng token vừa sinh ra
             
-        l0_emb = self.layer0_emb(layer0_tokens) # [B, Time, encoder_hidden]
-        
-        # 3. Dự đoán Tầng 1 đến 15 dựa trên (Text + Tầng 0)
-        x_fine = self.fine_pre_linear(text_value_expanded)
-        x_fine = x_fine + l0_emb # Ép sự phụ thuộc: Fine token phải khớp với Coarse token
-        
-        x_fine = self.fine_decoder(x_fine.transpose(1, 2))
-        logits_fine = self.fine_output(x_fine.transpose(1, 2)) # [B, Time, 15 * 2048]
-        
-        # 4. Gộp kết quả
-        B, T, _ = logits_fine.shape
-        logits_fine = logits_fine.view(B, T, self.n_mels - 1, self.vocab_size)
-        logits_coarse = logits_coarse.unsqueeze(2) # [B, Time, 1, 2048]
-        
-        # Output: [B, Time, 16, 2048]
-        logits = torch.cat([logits_coarse, logits_fine], dim=2)
-        
+        # 3. Chạy vòng lặp truyền trạng thái nối tiếp nhau
+        for i in range(self.n_mels - 1): 
+            # Bơm thông tin token của tầng hiện tại vào hidden state
+            emb_i = self.layer_embs[i](current_tokens)
+            current_hidden = current_hidden + emb_i 
+            
+            # Xử lý Conv Block
+            h = self.fine_decoder(current_hidden.transpose(1, 2)).transpose(1, 2)
+            
+            # Dự đoán Tầng tiếp theo (i+1) thông qua Head riêng
+            logits_i = self.fine_outputs[i](h)
+            logits_list.append(logits_i.unsqueeze(2))
+            
+            # Chuẩn bị Token cho vòng lặp kế tiếp
+            if targets is not None:
+                current_tokens = targets[:, :, i+1]
+            else:
+                current_tokens = torch.argmax(logits_i, dim=-1)
+                
+        # Gộp tất cả 16 tầng lại
+        logits = torch.cat(logits_list, dim=2) # Shape: [B, Time, 16, 2048]
         return logits
 
 class DurationPredictor(nn.Module):

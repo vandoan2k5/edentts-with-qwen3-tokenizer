@@ -113,9 +113,9 @@ class EdenTTS(AbstractModel):
         _tmp_mask_2 = mel_mask.unsqueeze(1).repeat(1, text_value.size(2), 1)
         text_value_expanded = text_value_expanded.masked_fill(_tmp_mask_2, 0.0)
 
-        target_layer0 = speech[:, :, 0]
+        # target_layer0 = speech[:, :, 0]
         # mel_pred lúc này là Logits có shape: [B, Time, 16, 2048]
-        mel_pred = self.decoder(text_value_expanded.transpose(1, 2), target_layer0=target_layer0)
+        mel_pred = self.decoder(text_value_expanded.transpose(1, 2), targets=speech)
         
         # Trả về các thành phần phục vụ tính CrossEntropy Loss
         return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
