@@ -74,11 +74,44 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             m_target_refine = m_target[:, :, 4:]
             
             # Tính loss riêng lẻ
-            mel_loss_base = mel_loss_func(mel_pred_base, m_target_base, mel_lens)
+            # Tính loss riêng lẻ (Cross Entropy)
             mel_loss_refine = mel_loss_func(mel_pred_refine, m_target_refine, mel_lens)
-            
-            # Gộp tổng mel_loss (Bạn có thể nhân trọng số cho Base ở đây nếu muốn ưu tiên Base hơn, vd: 2.0 * mel_loss_base)
-            mel_loss = mel_loss_base + mel_loss_refine
+            mel_loss_base = mel_loss_func(mel_pred_base, m_target_base, mel_lens)
+
+            # ==================================================
+            # THÊM CONTINUOUS EMBEDDING LOSS (ĐÃ SỬA LỖI MASK)
+            # ==================================================
+            emb_weight = model.audio_emb.weight.detach() # [2048, hidden_dim]
+
+            # 1. Tạo mask để CHỈ lấy các frame âm thanh thực tế, bỏ qua padding
+            valid_mask = ~get_mask_from_lengths(mel_lens, max_len=mel_pred.shape[1]).to(device)
+
+            # 2. Trích xuất layer 0
+            pred_L0 = mel_pred_base[:, :, 0, :] # [B, T, 2048]
+            target_L0 = m_target_base[:, :, 0]  # [B, T]
+
+            # 3. Lọc qua mask: Ép thành mảng 2D chỉ chứa các frame hợp lệ
+            valid_pred_L0 = pred_L0[valid_mask]   # [N_valid_frames, 2048]
+            valid_target_L0 = target_L0[valid_mask] # [N_valid_frames]
+
+            # 4. Tính xác suất (Softmax) và Soft-Embedding
+            probs_L0 = torch.nn.functional.softmax(valid_pred_L0, dim=-1)
+            soft_emb_pred = torch.matmul(probs_L0, emb_weight) # [N_valid_frames, hidden_dim]
+
+            # 5. Lấy Hard-Embedding thực tế
+            hard_emb_target = model.audio_emb(valid_target_L0) # [N_valid_frames, hidden_dim]
+
+            # 6. Tính độ lệch MSE (Chỉ trên các frame có ý nghĩa)
+            continuous_loss = torch.nn.functional.mse_loss(soft_emb_pred, hard_emb_target)
+
+            # ==================================================
+            # GỘP TỔNG LOSS
+            # ==================================================
+            # Ở đây mình nâng nhẹ trọng số của Refine lên 1.5 để mô hình khôi phục chi tiết sóng âm tốt hơn
+            if e <= 15:  # Trong 10 epoch đầu, tập trung vào Base để mô hình học tốt cấu trúc chung
+                mel_loss = mel_loss_base + 1.0 * continuous_loss + 0.1 * mel_loss_refine
+            else:  # Sau đó, tăng dần trọng số của Refine để cải thiện
+                mel_loss = 0.5 * mel_loss_base + 2.0 * continuous_loss + 2.0 * mel_loss_refine
             
             dur_loss = duration_loss_func(log_dur_pred, log_dur_target, text_lens)
             attn_loss = guided_atten_loss_func(alpha, text_lens, mel_lens)
@@ -101,6 +134,21 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
                     target_L0 = m_target[:, :, 0]
                     correct_L0 = (pred_ids_L0[valid_mask] == target_L0[valid_mask]).sum().item()
                     stats["acc_L0"] = correct_L0 / total_valid_frames
+
+                    pred_ids_L1 = torch.argmax(mel_pred[:, :, 1, :], dim=-1)
+                    target_L1 = m_target[:, :, 1]
+                    correct_L1 = (pred_ids_L1[valid_mask] == target_L1[valid_mask]).sum().item()
+                    stats["acc_L1"] = correct_L1 / total_valid_frames
+
+                    pred_ids_L2 = torch.argmax(mel_pred[:, :, 2, :], dim=-1)
+                    target_L2 = m_target[:, :, 2]
+                    correct_L2 = (pred_ids_L2[valid_mask] == target_L2[valid_mask]).sum().item()
+                    stats["acc_L2"] = correct_L2 / total_valid_frames   
+
+                    pred_ids_L3 = torch.argmax(mel_pred[:, :, 3, :], dim=-1)
+                    target_L3 = m_target[:, :, 3]
+                    correct_L3 = (pred_ids_L3[valid_mask] == target_L3[valid_mask]).sum().item()
+                    stats["acc_L3"] = correct_L3 / total_valid_frames
                     
                     # --- B. TOP-5 ACCURACY ---
                     _, top5_preds = torch.topk(mel_pred, k=5, dim=-1)
@@ -122,7 +170,7 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             # LƯU Ý THÊM: Log thêm 2 loss con
             stats["mel_base"] = mel_loss_base.item()
             stats["mel_refine"] = mel_loss_refine.item()
-            
+            stats["continuous_emb"] = continuous_loss.item()
             stats["dur"] = dur_loss.item()
             stats["attn"] = attn_loss.item()
             running_loss += loss.item()
@@ -136,8 +184,12 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
                 "dur_loss": dur_loss.item(),
                 "attn_loss": attn_loss.item(),
                 "acc_L0": stats["acc_L0"],
+                "acc_L1": stats["acc_L1"],
+                "acc_L2": stats["acc_L2"],
+                "acc_L3": stats["acc_L3"],
                 "top5_acc": stats["top5"],
-                "acc_all": stats["acc"]
+                "acc_all": stats["acc"],
+                "continuous_emb_loss": stats["continuous_emb"]
             })
             speed = i / (time.time() - start)
             save_stats(stats, paths, step)

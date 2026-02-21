@@ -36,32 +36,35 @@ def pe_loss_func(d_pred, d_target, ilens):
 
 def mel_loss_func(logits, targets, mel_lens):
     """
-    logits: [Batch, Time, 16, 2048] 
-    targets: [Batch, Time, 16] 
+    logits: [Batch, Time, N_Layers, Vocab_Size] 
+    targets: [Batch, Time, N_Layers] 
     mel_lens: [Batch] 
     """
-    # 1. Tạo mask và lọc padding
+    # 1. Lấy số lượng layer thực tế (Ví dụ: 4 cho base, 12 cho refine, hoặc 16 cho gốc)
+    n_layers = logits.shape[2]
+    vocab_size = logits.shape[-1]
+    
+    # 2. Tạo mask và lọc padding
     mel_masks = ~get_mask_from_lengths(mel_lens, max_len=logits.shape[1]).to(logits.device)
     
-    # Lọc lấy các token hợp lệ (Tự động gộp Batch và Time)
-    # valid_logits: [N_frames, 16, 2048]
-    # valid_targets: [N_frames, 16]
+    # valid_logits: [N_frames, N_Layers, Vocab_Size]
+    # valid_targets: [N_frames, N_Layers]
     valid_logits = logits[mel_masks] 
     valid_targets = targets[mel_masks]
     
-    # 2. Tính loss riêng cho từng token (reduction='none')
+    # 3. Tính loss riêng cho từng token (reduction='none')
     loss_per_token = F.cross_entropy(
-        valid_logits.view(-1, 2048), 
+        valid_logits.view(-1, vocab_size), 
         valid_targets.reshape(-1).long(),
         reduction='none'
     )
     
-    # 3. Reshape lại để tách 16 tầng ra: [N_frames, 16]
-    loss_per_layer = loss_per_token.view(-1, 16)
+    # 4. Reshape lại theo đúng số layer TRUYỀN VÀO (thay vì fix cứng 16)
+    loss_per_layer = loss_per_token.view(-1, n_layers) # <--- ĐÃ SỬA LỖI Ở ĐÂY
     
-    # 4. Tạo bộ trọng số giảm dần cho 16 tầng (Tầng 1 quan trọng nhất)
-    weights = torch.tensor([0.75 ** i for i in range(16)], device=logits.device)
+    # 5. Đánh trọng số cho các tầng
+    weights = torch.ones(n_layers, device=logits.device) # <--- ĐÃ SỬA LỖI CHẬM HỘI TỤ Ở ĐÂY
     
-    # 5. Nhân trọng số và tính trung bình
+    # 6. Nhân trọng số và tính trung bình
     weighted_loss = loss_per_layer * weights
     return weighted_loss.mean()
