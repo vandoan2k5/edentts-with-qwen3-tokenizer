@@ -25,10 +25,11 @@ class EdenTTS(AbstractModel):
         super().__init__()
         self.duration_offset = duration_offset
         self.delta = h.delta
-        self.n_mels = h.num_mels  # Thường là 16 tầng Codebook
-        self.vocab_size = 2048    # Kích thước từ điển của Qwen3
+        self.n_mels = h.num_mels  # 16
+        self.vocab_size = 2048    
         self.audio_emb = nn.Embedding(self.vocab_size, h.n_channels)
 
+        # Khởi tạo đầy đủ các module theo config gốc thay vì dùng "..."
         self.text_encoder = TextEncoder(n_channels=h.n_channels,
                                         encoder_layer=h.text_encoder_layers,
                                         encoder_hidden=h.text_encoder_hidden,
@@ -52,31 +53,48 @@ class EdenTTS(AbstractModel):
             dropout=h.duration_predicotr_dropout
         )
 
-        # LƯU Ý: Lớp Decoder bây giờ sẽ khởi tạo mel_output_layer với kích thước (16 * 2048)
-        self.decoder = Decoder(idim=h.n_channels,
-                               encoder_hidden=h.decoder_hidden,
-                               n_decoder_layer=h.decoder_layers,
-                               k_size=h.decoder_ksize,
-                               nonlinear_activation=nonlinear_activation,
-                               nonlinear_activation_params=nonlinear_activation_params,
-                               dropout_rate=h.decoder_dropout,
-                               use_weight_norm=use_weight_norm,
-                               n_mels=h.num_mels,  # Truyền vào 16
-                               dialations=h.decoder_dilation)
+        # --- NÂNG CẤP 1: Tách Decoder thành Base và Refine ---
+        # 1. Base Decoder: Dự đoán 4 layer quan trọng nhất
+        self.base_decoder = Decoder(
+            idim=h.n_channels,
+            encoder_hidden=h.decoder_hidden,
+            n_decoder_layer=h.decoder_layers, 
+            k_size=h.decoder_ksize,
+            nonlinear_activation=nonlinear_activation,
+            nonlinear_activation_params=nonlinear_activation_params,
+            dropout_rate=h.decoder_dropout,
+            use_weight_norm=use_weight_norm,
+            n_mels=4,  # Chỉ xuất ra 4 layer đầu
+            dialations=h.decoder_dilation
+        )
 
-        # Trong cơ chế Classification của Audio Token, PostNet thường không còn cần thiết.
-        # Chúng ta gán bằng None để tránh lỗi Shape Mismatch 80-16.
+        # 2. Refine Decoder: Dự đoán 12 layer còn lại
+        self.refine_cond_proj = nn.Linear(4 * h.n_channels, h.n_channels)
+        
+        self.refine_decoder = Decoder(
+            idim=h.n_channels,
+            encoder_hidden=h.decoder_hidden,
+            n_decoder_layer=max(1, h.decoder_layers // 2), 
+            k_size=h.decoder_ksize,
+            nonlinear_activation=nonlinear_activation,
+            nonlinear_activation_params=nonlinear_activation_params,
+            dropout_rate=h.decoder_dropout,
+            use_weight_norm=use_weight_norm,
+            n_mels=12,  # Xuất ra 12 layer cuối (16 - 4)
+            dialations=h.decoder_dilation
+        )
+
         self.postnet = None
 
         te = parameter_count(self.text_encoder)
-        de = parameter_count(self.decoder)
+        de = parameter_count(self.base_decoder) + parameter_count(self.refine_decoder)
         du = parameter_count(self.duration_predictor)
         logging.info(f"tol_params: {parameter_count(self)}, "
                      f"text_encoder:{te},"
                      f"decoder:{de},"
                      f"dur:{du},"
                      f"tol_infer:{te + de + du}")
-        
+
     def forward(
         self,
         phone_ids: torch.Tensor,
@@ -107,27 +125,38 @@ class EdenTTS(AbstractModel):
         log_dur_pred = self.duration_predictor(text_value)
         log_dur_target = torch.log(dur0.detach() + self.duration_offset)
 
-        text_value_expanded = torch.bmm(
-            text_value.transpose(1, 2), reconst_alpha
-        )
+        text_value_expanded = torch.bmm(text_value.transpose(1, 2), reconst_alpha)
         _tmp_mask_2 = mel_mask.unsqueeze(1).repeat(1, text_value.size(2), 1)
         text_value_expanded = text_value_expanded.masked_fill(_tmp_mask_2, 0.0)
 
-        # target_layer0 = speech[:, :, 0]
-        # mel_pred lúc này là Logits có shape: [B, Time, 16, 2048]
-        mel_pred = self.decoder(text_value_expanded.transpose(1, 2), targets=speech)
+        # --- Base Decoder (Layer 1-4) ---
+        # text_value_expanded: [B, C, T]
+        mel_pred_base = self.base_decoder(text_value_expanded.transpose(1, 2), targets=speech[:, :, :4])
         
-        # Trả về các thành phần phục vụ tính CrossEntropy Loss
+        # --- Lấy Teacher Forcing Audio Context cho Refiner (Khi Training) ---
+        # speech: [B, T, 16], lấy 4 layer đầu -> [B, T, 4]
+        gt_base_tokens = speech[:, :, :4] 
+        # Embed gt_base_tokens: [B, T, 4] -> [B, T, 4, C]
+        base_emb = self.audio_emb(gt_base_tokens) 
+        # Flatten: [B, T, 4*C]
+        base_emb = base_emb.view(base_emb.size(0), base_emb.size(1), -1) 
+        
+        # Chiếu về kích thước hidden: [B, T, C]
+        refine_cond = self.refine_cond_proj(base_emb)
+        
+        # Cộng điều kiện vào text_expanded (transpose để khớp shape [B, T, C])
+        refine_input = text_value_expanded.transpose(1, 2) + refine_cond
+        
+        # --- Refine Decoder (Layer 5-16) ---
+        mel_pred_refine = self.refine_decoder(refine_input, targets=speech[:, :, 4:])
+        
+        # Gộp lại logits: [B, T, 16, 2048]
+        mel_pred = torch.cat([mel_pred_base, mel_pred_refine], dim=2)
+        
         return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
 
-    def inference(
-        self,
-        phone_ids: torch.Tensor,
-        delta=None,
-        d_control=1
-    ):
-        if delta is None:
-            delta = self.delta
+    def inference(self, phone_ids: torch.Tensor, delta=None, d_control=1):
+        if delta is None: delta = self.delta
         self.eval()
         with torch.no_grad():
             text_value = self.text_encoder.inference(phone_ids)
@@ -135,22 +164,28 @@ class EdenTTS(AbstractModel):
             
             if torch.sum(dur)/dur.size(0) < 1:
                 dur = 4*torch.ones_like(dur)
-                logging.warning("predict too short duration, use dummy ones")
                 
             e = torch.cumsum(dur, dim=1) - dur/2
             alpha = reconstruct_align_from_aligned_position(e, mel_lens=None, text_lens=None, delta=delta)
             
-            text_value_expanded = torch.bmm(
-                text_value.transpose(1, 2), alpha
-            )
+            text_value_expanded = torch.bmm(text_value.transpose(1, 2), alpha)
             
-            # mel_pred_logits: [1, Time, 16, 2048]
-            mel_pred_logits = self.decoder(text_value_expanded.transpose(1, 2))
-            # mel_pred_logits = mel_pred_logits.view(1, -1, self.n_mels, self.vocab_size)
+            # 1. Base Inference
+            mel_pred_base_logits = self.base_decoder(text_value_expanded.transpose(1, 2))
+            base_ids = torch.argmax(mel_pred_base_logits, dim=-1) # [1, T, 4]
             
-            # Lấy index có xác suất cao nhất (Greedy decoding)
-            # mel_pred_ids: [1, Time, 16]
-            mel_pred_ids = torch.argmax(mel_pred_logits, dim=-1)
+            # 2. Tạo condition từ Base ids vừa dự đoán (Auto-regressive over RVQ levels)
+            base_emb = self.audio_emb(base_ids) # [1, T, 4, C]
+            base_emb = base_emb.view(base_emb.size(0), base_emb.size(1), -1) # [1, T, 4*C]
+            refine_cond = self.refine_cond_proj(base_emb) # [1, T, C]
+            
+            # 3. Refine Inference
+            refine_input = text_value_expanded.transpose(1, 2) + refine_cond
+            mel_pred_refine_logits = self.refine_decoder(refine_input)
+            refine_ids = torch.argmax(mel_pred_refine_logits, dim=-1) # [1, T, 12]
+            
+            # Gộp kết quả
+            mel_pred_ids = torch.cat([base_ids, refine_ids], dim=2) # [1, T, 16]
             
         self.train()
         return mel_pred_ids

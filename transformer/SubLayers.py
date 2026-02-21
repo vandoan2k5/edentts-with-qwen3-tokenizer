@@ -58,35 +58,55 @@ class MultiHeadAttention(nn.Module):
 
 
 class PositionwiseFeedForward(nn.Module):
-    """ A two-feed-forward-layer module """
+    """ Tăng cường liên kết Temporal (Lấy cảm hứng từ Conformer Block) """
 
     def __init__(self, d_in, d_hid, kernel_size, dropout=0.1):
         super().__init__()
 
-        # Use Conv1D
-        # position-wise
+        # Lớp chiếu mở rộng
         self.w_1 = nn.Conv1d(
             d_in,
             d_hid,
-            kernel_size=kernel_size[0],
-            padding=(kernel_size[0] - 1) // 2,
+            kernel_size=1 # Pointwise
         )
-        # position-wise
+        
+        # NÂNG CẤP 2: Depthwise Convolution để liên kết các Time-Frames mạnh mẽ
+        # Ưu tiên kernel_size lớn hơn (vd config gốc bạn đặt 9, 17...)
+        dw_kernel = kernel_size[0] if isinstance(kernel_size, (list, tuple)) else kernel_size
+        self.depthwise_conv = nn.Conv1d(
+            d_hid,
+            d_hid,
+            kernel_size=dw_kernel,
+            padding=(dw_kernel - 1) // 2,
+            groups=d_hid # Depthwise
+        )
+
+        # Lớp chiếu thu hẹp
         self.w_2 = nn.Conv1d(
             d_hid,
             d_in,
-            kernel_size=kernel_size[1],
-            padding=(kernel_size[1] - 1) // 2,
+            kernel_size=1 # Pointwise
         )
 
         self.layer_norm = nn.LayerNorm(d_in)
         self.dropout = nn.Dropout(dropout)
+        self.activation = nn.SiLU() # Swish hoạt động tốt hơn ReLU cho Audio
 
     def forward(self, x):
         residual = x
+        
+        # Chuyển đổi sang (Batch, Channel, Time) cho Conv1d
         output = x.transpose(1, 2)
-        output = self.w_2(F.relu(self.w_1(output)))
-        output = output.transpose(1, 2)
+        
+        output = self.w_1(output)
+        output = self.activation(output)
+        
+        output = self.depthwise_conv(output)
+        output = self.activation(output)
+        
+        output = self.w_2(output)
+        output = output.transpose(1, 2) # Trả lại (Batch, Time, Channel)
+        
         output = self.dropout(output)
         output = self.layer_norm(output + residual)
 

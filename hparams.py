@@ -19,10 +19,10 @@ class Hparams(object):
         self.voc_path = r"C:\Users\home\Desktop\hifigan\pretrained\lj_wo_ft.pth.tar"
         self.vocab_size = 365  # number of input tokens
         # Training
-        self.tts_max_steps = 10000  #You may stop at around 100_000 for ljspeech dataset for acceptable speech quality
+        self.tts_max_steps = 25000  #You may stop at around 100_000 for ljspeech dataset for acceptable speech quality
         self.tts_max_mel_len = 400
         self.tts_bin_lengths = True   # bins the spectrogram lengths before sampling in data loader - speeds up training
-        self.tts_checkpoint_every = 1000  # checkpoints the model every X steps
+        self.tts_checkpoint_every = 5000  # checkpoints the model every X steps
         self.tts_show_info_every = 2   # print tran status every X steps
         self.tts_eval_every = 30
         self.lr = 1e-4
