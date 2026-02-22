@@ -114,6 +114,8 @@ class EdenTTS(AbstractModel):
                                      query_lens=mel_lens, e_weight=e_weight)
         
         dur0 = torch.sum(alpha, dim=-1)
+        dur_target = torch.clamp(dur0.detach(), min=1.0)
+        
         e = torch.cumsum(dur0, dim=-1)
         e = e - dur0/2
         reconst_alpha = reconstruct_align_from_aligned_position(e, mel_lens=mel_lens,
@@ -121,8 +123,7 @@ class EdenTTS(AbstractModel):
                                                                 delta=self.delta)
 
         log_dur_pred = self.duration_predictor(text_value)
-        log_dur_target = torch.log(dur0.detach() + self.duration_offset)
-
+        log_dur_target = torch.log(dur_target + self.duration_offset)
         text_value_expanded = torch.bmm(text_value.transpose(1, 2), reconst_alpha)
         _tmp_mask_2 = mel_mask.unsqueeze(1).repeat(1, text_value.size(2), 1)
         text_value_expanded = text_value_expanded.masked_fill(_tmp_mask_2, 0.0)
@@ -134,13 +135,23 @@ class EdenTTS(AbstractModel):
         
         return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
 
-    def inference(self, phone_ids: torch.Tensor, delta=None, d_control=1, temperature=0.8, top_k=1):
+    def inference(self, phone_ids: torch.Tensor, delta=None, d_control=1, temperature=0.8, top_k=5):
         if delta is None: delta = self.delta
         self.eval()
         with torch.no_grad():
             text_value = self.text_encoder.inference(phone_ids)
-            print(f"Text Encoder output shape: {text_value.shape}")  # Debug: Kiểm tra shape của text_value
-            dur = self.duration_predictor.inference(text_value)*d_control
+            print(f"Text Encoder output shape: {text_value.shape}")
+            
+            # --- FIX: Xử lý Duration ---
+            raw_dur = self.duration_predictor.inference(text_value) * d_control
+            
+            # 1. Làm tròn số để chuẩn hóa về số lượng token rời rạc
+            dur = torch.round(raw_dur)
+            
+            # 2. Clamp min=1.0 để BẮT BUỘC mỗi text token (phoneme) 
+            # phải có ít nhất 1 audio token tương ứng.
+            dur = torch.clamp(dur, min=1.0)
+            # ---------------------------
             
             if torch.sum(dur)/dur.size(0) < 1:
                 dur = 4*torch.ones_like(dur)
@@ -149,10 +160,9 @@ class EdenTTS(AbstractModel):
             alpha = reconstruct_align_from_aligned_position(e, mel_lens=None, text_lens=None, delta=delta)
             
             text_value_expanded = torch.bmm(text_value.transpose(1, 2), alpha)
-            print(f"Expanded Text Value shape: {text_value_expanded.shape}")  # Debug: Kiểm tra shape sau khi align
+            print(f"Expanded Text Value shape: {text_value_expanded.shape}")
             
             # --- CHẠY DECODER V2 INFERENCE ---
-            # DO targets=None, hàm forward bây giờ sẽ trực tiếp trả về mel_pred_ids [Batch, Time, 16]
             mel_pred_ids = self.decoder(
                 text_value_expanded.transpose(1, 2), 
                 targets=None, 

@@ -11,7 +11,6 @@ from utils.checkpoints import save_checkpoint, restore_checkpoint
 from utils.log_util import get_logger
 from models.loss import *
 from hparams import hparams as hp
-
 log = get_logger(__name__)
 
 def np_now(x: torch.Tensor): return x.detach().cpu().numpy()
@@ -104,14 +103,7 @@ def tts_train(paths: Paths, model: EdenTTS, optimizer, train_set: DataLoader, lr
             # 6. Tính độ lệch MSE (Chỉ trên các frame có ý nghĩa)
             continuous_loss = torch.nn.functional.mse_loss(soft_emb_pred, hard_emb_target)
 
-            # ==================================================
-            # GỘP TỔNG LOSS
-            # ==================================================
-            # Ở đây mình nâng nhẹ trọng số của Refine lên 1.5 để mô hình khôi phục chi tiết sóng âm tốt hơn
-            if e <= 15:  # Trong 10 epoch đầu, tập trung vào Base để mô hình học tốt cấu trúc chung
-                mel_loss = mel_loss_base + 1.0 * continuous_loss + 0.1 * mel_loss_refine
-            else:  # Sau đó, tăng dần trọng số của Refine để cải thiện
-                mel_loss = 0.5 * mel_loss_base + 2.0 * continuous_loss + 2.0 * mel_loss_refine
+            mel_loss = mel_loss_base + continuous_loss + mel_loss_refine
             
             dur_loss = duration_loss_func(log_dur_pred, log_dur_target, text_lens)
             attn_loss = guided_atten_loss_func(alpha, text_lens, mel_lens)

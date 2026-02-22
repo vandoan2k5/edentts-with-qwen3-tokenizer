@@ -17,7 +17,7 @@ class Hparams(object):
         # we use the model LJ_FT_T2_V1 in the article
         self.voc_path = "path/to/hifigan_vocoder"
         self.voc_path = r"C:\Users\home\Desktop\hifigan\pretrained\lj_wo_ft.pth.tar"
-        self.vocab_size = 365  # number of input tokens
+        self.vocab_size = 4096  # number of input tokens
         # Training
         self.tts_max_steps = 50000  #You may stop at around 100_000 for ljspeech dataset for acceptable speech quality
         self.tts_max_mel_len = 400
@@ -79,6 +79,17 @@ class Hparams(object):
         self.fmin = 0
         self.fmax = 8000
         self.bits = 16  # bit depth of signal
+
+        # CIF CONFIG ---------------------------------------------------------#
+        self.cif_threshold = 0.999 
+        self.encoder_embed_dim = self.n_channels           # <--- ĐỔI Ở ĐÂY (thay vì text_encoder_hidden)
+        self.cif_embedding_dim = self.n_channels           
+        self.produce_weight_type = "conv"                  
+        self.conv_cif_width = 3
+        self.conv_cif_dropout = 0.1
+        self.apply_scaling = True
+        self.apply_tail_handling = True
+        self.tail_handling_firing_threshold = 0.5
 
         # ----------------------------------------------------------------------------------------------------------------#
         # overwrite default settings with config file
