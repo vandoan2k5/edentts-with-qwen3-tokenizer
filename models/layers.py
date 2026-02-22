@@ -16,7 +16,7 @@ logging = get_logger(__name__)
 
 
 def reconstruct_align_from_aligned_position(
-             e, delta=0.2, mel_lens=None,
+             e, delta=0.1, mel_lens=None,
             text_lens=None, max_mel_len=None):
     """Reconstruct alignment matrix from aligned positions.
             Args:

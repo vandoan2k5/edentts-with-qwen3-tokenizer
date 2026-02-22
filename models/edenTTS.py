@@ -69,18 +69,16 @@ class EdenTTS(AbstractModel):
 
         # --- NÂNG CẤP: DÙNG DUY NHẤT 1 DECODER CASCADED ---
         # DecoderV2 sẽ tự động dự đoán Tầng 0, sau đó lấy Tầng 0 làm input dự đoán Tầng 1, v.v... đến 15.
-        self.decoder = DecoderV3(
-            idim=h.n_channels,
-            encoder_hidden=h.decoder_hidden,
-            n_decoder_layer=h.decoder_layers, 
-            k_size=h.decoder_ksize,
-            nonlinear_activation=nonlinear_activation,
-            nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=h.decoder_dropout,
-            use_weight_norm=use_weight_norm,
-            n_mels=h.num_mels,  # Xuất ra đủ 16 layer
-            dialations=h.decoder_dilation
-        )
+        decoder_config = DecoderConfig(
+            idim=h.n_channels,                 # Khớp với output của Text Encoder (sau khi align)
+            hidden_size=h.decoder_hidden,      # Kích thước ẩn của Llama blocks
+            vocab_size=self.vocab_size,        # 2048
+            num_codebooks=h.num_mels,          # 16 layers RVQ
+            num_layers_coarse=4,
+            num_layers_priority=2,
+            num_layers_shared=2
+            )
+        self.decoder = TransformerDecoderV3(config=decoder_config)
         
         # Đã xóa bỏ refine_cond_proj vì DecoderV2 tự xử lý nội bộ
 
@@ -136,11 +134,12 @@ class EdenTTS(AbstractModel):
         
         return log_dur_pred, log_dur_target, mel_pred, alpha, reconst_alpha
 
-    def inference(self, phone_ids: torch.Tensor, delta=None, d_control=1, temperature=0.8, top_k=5):
+    def inference(self, phone_ids: torch.Tensor, delta=None, d_control=1, temperature=0.8, top_k=1):
         if delta is None: delta = self.delta
         self.eval()
         with torch.no_grad():
             text_value = self.text_encoder.inference(phone_ids)
+            print(f"Text Encoder output shape: {text_value.shape}")  # Debug: Kiểm tra shape của text_value
             dur = self.duration_predictor.inference(text_value)*d_control
             
             if torch.sum(dur)/dur.size(0) < 1:
@@ -150,30 +149,16 @@ class EdenTTS(AbstractModel):
             alpha = reconstruct_align_from_aligned_position(e, mel_lens=None, text_lens=None, delta=delta)
             
             text_value_expanded = torch.bmm(text_value.transpose(1, 2), alpha)
+            print(f"Expanded Text Value shape: {text_value_expanded.shape}")  # Debug: Kiểm tra shape sau khi align
             
             # --- CHẠY DECODER V2 INFERENCE ---
-            # Truyền targets=None để mạng tự động lấy mẫu nối tiếp nhau từ Tầng 0 -> 15
-            mel_pred_logits = self.decoder(
+            # DO targets=None, hàm forward bây giờ sẽ trực tiếp trả về mel_pred_ids [Batch, Time, 16]
+            mel_pred_ids = self.decoder(
                 text_value_expanded.transpose(1, 2), 
                 targets=None, 
                 temperature=temperature, 
                 top_k=top_k
-            ) # [Batch, Time, 16, 2048]
-            
-            # Hàm lấy mẫu (Sample thay vì Argmax) cho Output cuối cùng
-            def sample_tokens(logits, temp, k):
-                logits = logits / temp
-                top_v, _ = torch.topk(logits, k, dim=-1)
-                logits[logits < top_v[..., [-1]]] = -float('Inf')
-                probs = torch.nn.functional.softmax(logits, dim=-1)
-                
-                shape = probs.shape
-                probs_flat = probs.view(-1, shape[-1])
-                sampled_flat = torch.multinomial(probs_flat, 1)
-                return sampled_flat.view(*shape[:-1])
-
-            # Lấy IDs cuối cùng: [Batch, Time, 16]
-            mel_pred_ids = sample_tokens(mel_pred_logits, temp=temperature, k=top_k)
+            )
             
         self.train()
         return mel_pred_ids
