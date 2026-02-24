@@ -1,48 +1,132 @@
-"""
-@author: edenmyn
-@email: edenmyn
-@time: 2022/10/16 10:54
-@DESC: 
-
-"""
-from .layers import *
-import torch.nn as nn
-from transformer.Layers import FFTBlock
-from models.layers import TokenEmbedding
-from transformer.Models import get_sinusoid_encoding_table
-from collections import OrderedDict
-from models.modules import Conv, Linear
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from typing import Tuple, Optional
-from hparams import hparams
 
+# --- Custom & External Imports ---
+from transformer.Layers import FFTBlock
+from transformer.Models import get_sinusoid_encoding_table
+from collections import OrderedDict
+from models.modules import Conv
+
+from utils.log_util import get_logger
+try:
+    from utils.net_utils import get_padding
+except ImportError:
+    def get_padding(kernel_size, dilation=1):
+        return (kernel_size * dilation - dilation) // 2
+
+logging = get_logger(__name__)
+
+# Import Global params và các Config class
+from hparams import hparams as hp, ModelArgs, DecoderConfig
+
+
+
+class LayerNorm(nn.LayerNorm):
+    """Layer normalization hỗ trợ đa chiều (transpose)"""
+    def __init__(self, nout, dim=-1):
+        super().__init__(nout, eps=1e-12)
+        self.dim = dim
+
+    def forward(self, x):
+        if self.dim == -1:
+            return super().forward(x)
+        return super().forward(x.transpose(1, -1)).transpose(1, -1)
+
+class ResConv1d(nn.Module):
+    """Khối Residual Convolution 1D tiêu chuẩn"""
+    def __init__(self, n_channels=512, k_size=5, nonlinear_activation="LeakyReLU",
+                 nonlinear_activation_params={"negative_slope": 0.1}, dropout_rate=0.1, dilation=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_channels, n_channels, kernel_size=k_size, 
+                      padding=get_padding(k_size, dilation), dilation=dilation),
+            getattr(nn, nonlinear_activation)(**nonlinear_activation_params),
+            nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        )
+
+    def forward(self, x):
+        return x + self.conv(x)
+
+class ResConvBlock(nn.Module):
+    """Chuỗi các khối ResConv1d với tùy chọn Weight Norm"""
+    def __init__(self, num_layers, n_channels=512, k_size=5, use_weight_norm=True, dilations=None):
+        super().__init__()
+        layers = []
+        if dilations is not None:
+            for d in dilations:
+                layers.append(ResConv1d(n_channels, k_size, dilation=d))
+        else:
+            for _ in range(num_layers):
+                layers.append(ResConv1d(n_channels, k_size))
+        
+        self.layers = nn.Sequential(*layers)
+        if use_weight_norm:
+            self.apply_weight_norm()
+
+    def apply_weight_norm(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.utils.weight_norm(m)
+
+    def forward(self, x):
+        return self.layers(x)
+
+class TokenEmbedding(nn.Module):
+    """Lớp Embedding cho Phonemes/Text"""
+    def __init__(self, hidden_size=384, padding_idx=0, vocab_size=365):
+        super().__init__()
+        self.phone_embed_layer = nn.Embedding(vocab_size, hidden_size, padding_idx=padding_idx)
+
+    def forward(self, phone_ids):
+        return self.phone_embed_layer(phone_ids)
+
+# ==========================================
+# 1. UTILS & HELPERS
+# ==========================================
+
+def get_mask_from_lengths(lengths, max_len=None):
+    if max_len is None:
+        max_len = torch.max(lengths).item()
+    ids = torch.arange(0, max_len, device=lengths.device)
+    mask = (ids >= lengths.unsqueeze(1)).bool()
+    return mask
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.0)
+    return m
+
+def sample_token(logits: torch.Tensor, topk: int = 5, temperature: float = 1.0) -> torch.Tensor:
+    logits = logits / max(temperature, 1e-5)
+    v, _ = torch.topk(logits, min(topk, logits.size(-1)))
+    pivot = v[..., [-1]]
+    logits[logits < pivot] = -float('Inf')
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(*probs.shape[:-1])
+
+
+# ==========================================
+# 3. TEXT ENCODER
+# ==========================================
 
 class TextEncoder(torch.nn.Module):
     """
-     this is the text encoder adapted from fastspeech
-     we add make a small modification on the position embedding
+    Text encoder adapted from FastSpeech
     """
-    def __init__(self, encoder_layer=5,
-        encoder_head =2,
-        encoder_hidden=256,
-        conv_filter_size=1024,
-        conv_kernel_size=[9, 1],
-        encoder_dropout=0.2,
-        n_channels=512,
-        vocab_size=365):
+    def __init__(self, encoder_layer=5, encoder_head=2, encoder_hidden=256,
+                 conv_filter_size=1024, conv_kernel_size=[9, 1], encoder_dropout=0.2,
+                 n_channels=512, vocab_size=365):
         super().__init__()
         max_seq_len = 1000
         n_position = max_seq_len + 1
         d_word_vec = n_channels
         n_layers = encoder_layer
         n_head = encoder_head
-        d_k = d_v = (
-                encoder_hidden
-                // encoder_head
-        )
+        d_k = d_v = (encoder_hidden // encoder_head)
         d_model = encoder_hidden
         d_inner = conv_filter_size
         kernel_size = conv_kernel_size
@@ -56,14 +140,10 @@ class TextEncoder(torch.nn.Module):
             requires_grad=False,
         )
         self.pre_linear = torch.nn.Linear(in_features=n_channels, out_features=encoder_hidden)
-        self.layer_stack = nn.ModuleList(
-            [
-                FFTBlock(
-                    d_model, n_head, d_k, d_v, d_inner, kernel_size, dropout=dropout
-                )
-                for _ in range(n_layers)
-            ]
-        )
+        self.layer_stack = nn.ModuleList([
+            FFTBlock(d_model, n_head, d_k, d_v, d_inner, kernel_size, dropout=dropout)
+            for _ in range(n_layers)
+        ])
         self.linear_key = nn.Linear(encoder_hidden, n_channels)
         self.linear_value = nn.Linear(encoder_hidden, n_channels)
 
@@ -72,34 +152,24 @@ class TextEncoder(torch.nn.Module):
         enc_slf_attn_list = []
         batch_size, max_len = src_seq.shape[0], src_seq.shape[1]
 
-        # -- Prepare masks
         slf_attn_mask = mask.unsqueeze(1).expand(-1, max_len, -1)
 
-        # -- Forward
-        # use abosolute positonal embedding, same as the original fastspeech FFT
         if hp.pos_embed_scheme == "absolute":
-            # -- Forward
             if not self.training and src_seq.shape[1] > self.max_seq_len:
                 enc_output = self.src_word_emb(src_seq) + get_sinusoid_encoding_table(
                     src_seq.shape[1], self.d_model
-                )[: src_seq.shape[1], :].unsqueeze(0).expand(batch_size, -1, -1).to(
-                    src_seq.device
-                )
+                )[: src_seq.shape[1], :].unsqueeze(0).expand(batch_size, -1, -1).to(src_seq.device)
             else:
-                enc_output = self.src_word_emb(src_seq) + self.position_enc[
-                    :, :max_len, :
-                ].expand(batch_size, -1, -1)
+                enc_output = self.src_word_emb(src_seq) + self.position_enc[:, :max_len, :].expand(batch_size, -1, -1)
         else:
-        # do not use the position embedding or use relative position embedding
-        # leads to better performance especially for longer sentences
             enc_output = self.src_word_emb(src_seq)
+            
         enc_output = self.pre_linear(enc_output)
         for enc_layer in self.layer_stack:
-            enc_output, enc_slf_attn = enc_layer(
-                enc_output, mask=mask, slf_attn_mask=slf_attn_mask
-            )
+            enc_output, enc_slf_attn = enc_layer(enc_output, mask=mask, slf_attn_mask=slf_attn_mask)
             if return_attns:
                 enc_slf_attn_list += [enc_slf_attn]
+                
         text_key = self.linear_key(enc_output)
         text_value = self.linear_value(enc_output)
         return text_key, text_value
@@ -110,265 +180,177 @@ class TextEncoder(torch.nn.Module):
         return text_value
 
 
-class MelEncoder(torch.nn.Module):
-    def __init__(self, n_mels, n_channels, nonlinear_activation, nonlinear_activation_params,
-                 dropout_rate, n_mel_encoder_layer, k_size, use_weight_norm,
-                 dilations=None, vocab_size=2048, num_base_layers=4):
+# ==========================================
+# 4. CIF MIDDLEWARE
+# ==========================================
+
+class CifMiddleware(nn.Module):
+    def __init__(self, cfg):
         super().__init__()
-        self.num_base_layers = num_base_layers
-        
-        # 1. Khởi tạo 4 lớp Embedding độc lập cho 4 layer (0, 1, 2, 3)
-        # Việc dùng embedding riêng giúp mô hình phân biệt được ý nghĩa của token ở layer 0 khác với layer 1
-        self.embeddings = torch.nn.ModuleList([
-            torch.nn.Embedding(vocab_size, n_channels) for _ in range(num_base_layers)
-        ])
-        
-        # 2. Thêm LayerNorm theo yêu cầu để ổn định phương sai sau khi cộng gộp
-        self.layer_norm = torch.nn.LayerNorm(n_channels)
-        
-        # 3. Mạng Conv1D chính
-        self.mel_encoder = ResConvBlock(
-            num_layers=n_mel_encoder_layer, n_channels=n_channels, k_size=k_size,
-            nonlinear_activation=nonlinear_activation,
-            nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dilations
-        )
+        self.cif_threshold = cfg.cif_threshold
+        self.cif_output_dim = cfg.cif_embedding_dim
+        self.encoder_embed_dim = cfg.encoder_embed_dim
+        self.produce_weight_type = cfg.produce_weight_type
+        self.conv_cif_width = cfg.conv_cif_width
+        self.conv_cif_dropout = cfg.conv_cif_dropout
+        self.apply_scaling = cfg.apply_scaling
+        self.apply_tail_handling = cfg.apply_tail_handling
+        self.tail_handling_firing_threshold = cfg.tail_handling_firing_threshold
 
-    def forward(self, speech):
-        # speech ban đầu có dạng [Batch, Time, 16]
-        # Trích xuất 4 layer đầu tiên: [Batch, Time, 4]
-        speech_base = speech[:, :, :self.num_base_layers] 
-        
-        # Tính embedding cho từng layer và cộng dồn lại (Summation)
-        mel_h = 0
-        for i in range(self.num_base_layers):
-            # Lấy token của layer thứ i và nhúng nó
-            emb_i = self.embeddings[i](speech_base[:, :, i]) # [Batch, Time, n_channels]
-            mel_h = mel_h + emb_i
-            
-        # Đi qua LayerNorm để chuẩn hóa các giá trị sau khi cộng
-        mel_h = self.layer_norm(mel_h)
-        
-        # Đổi chiều [Batch, Time, Channels] thành [Batch, Channels, Time] cho mạng Conv1D
-        mel_h = mel_h.transpose(1, 2) 
-        mel_h = self.mel_encoder(mel_h)
-        
-        # Trả về kích thước gốc [Batch, Time, Channels]
-        return mel_h.transpose(1, 2)
-    
-class DecoderV3(torch.nn.Module):
-    def __init__(self, idim, encoder_hidden, n_decoder_layer, k_size,
-                 nonlinear_activation, nonlinear_activation_params,
-                 dropout_rate, use_weight_norm, n_mels, vocab_size=2048, dialations=None):
-        super().__init__()
-        self.n_mels = n_mels
-        self.vocab_size = vocab_size
-        self.hidden_size = encoder_hidden
-        
-        # --- TẦNG 0: COARSE (Mỏ neo ngữ nghĩa) ---
-        self.coarse_pre_linear = torch.nn.Linear(idim, encoder_hidden)
-        self.coarse_decoder = ResConvBlock(
-            num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
-            nonlinear_activation=nonlinear_activation,
-            nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
-        )
-        self.coarse_output = torch.nn.Linear(encoder_hidden, vocab_size)
-
-        # --- TẦNG 1, 2, 3: DEDICATED BLOCKS (Tập trung giải quyết sụp đổ) ---
-        # Mỗi tầng quan trọng có 1 block riêng biệt để học Acoustic Texture
-        self.priority_decoders = nn.ModuleList([
-            ResConvBlock(
-                num_layers=n_decoder_layer, n_channels=encoder_hidden, k_size=k_size,
-                nonlinear_activation=nonlinear_activation,
-                nonlinear_activation_params=nonlinear_activation_params,
-                dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
-            ) for _ in range(3) # Dành cho L1, L2, L3
-        ])
-        
-        # --- TẦNG 4 -> 15: SHARED BLOCK (Tiết kiệm tài nguyên) ---
-        self.fine_decoder_shared = ResConvBlock(
-            num_layers=max(1, n_decoder_layer // 2), n_channels=encoder_hidden, k_size=k_size,
-            nonlinear_activation=nonlinear_activation,
-            nonlinear_activation_params=nonlinear_activation_params,
-            dropout_rate=dropout_rate, use_weight_norm=use_weight_norm, dilations=dialations
-        )
-
-        # --- EMBEDDINGS & HEADS ---
-        self.layer_embs = nn.ModuleList([
-            torch.nn.Embedding(vocab_size, encoder_hidden) for _ in range(n_mels - 1)
-        ])
-        
-        # Lớp Linear để hòa trộn (Fusion) thay vì cộng thô
-        self.fusion_layers = nn.ModuleList([
-            torch.nn.Linear(encoder_hidden * 2, encoder_hidden) for _ in range(n_mels - 1)
-        ])
-
-        self.fine_outputs = nn.ModuleList([
-            torch.nn.Linear(encoder_hidden, vocab_size) for _ in range(n_mels - 1)
-        ])
-
-    def sample_tokens(self, logits, temperature=0.8, top_k=5):
-        logits = logits / temperature
-        top_v, _ = torch.topk(logits, top_k, dim=-1)
-        logits[logits < top_v[..., [-1]]] = -float('Inf')
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        shape = probs.shape
-        probs_flat = probs.view(-1, shape[-1])
-        sampled_flat = torch.multinomial(probs_flat, 1)
-        return sampled_flat.view(*shape[:-1])
-
-    def forward(self, text_value_expanded, targets=None, temperature=0.8, top_k=5, teacher_forcing_ratio=0.75):
-        B, T, _ = text_value_expanded.shape
-        
-        # 1. DỰ ĐOÁN TẦNG 0
-        x_coarse = self.coarse_pre_linear(text_value_expanded)
-        x_coarse = self.coarse_decoder(x_coarse.transpose(1, 2)).transpose(1, 2)
-        logits_coarse = self.coarse_output(x_coarse)
-        logits_list = [logits_coarse.unsqueeze(2)]
-        
-        # Trạng thái ẩn hiện tại (bắt đầu từ output của Coarse Decoder)
-        current_hidden = x_coarse 
-        
-        # Lấy token khởi đầu
-        if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
-            current_tokens = targets[:, :, 0]
+        if self.produce_weight_type == "dense":
+            self.dense_proj = Linear(self.encoder_embed_dim, self.encoder_embed_dim).cuda()
+            self.weight_proj = Linear(self.encoder_embed_dim, 1).cuda()
+        elif self.produce_weight_type == "conv":
+            self.conv = torch.nn.Conv1d(
+                self.encoder_embed_dim, self.encoder_embed_dim, self.conv_cif_width,
+                stride=1, padding=int(self.conv_cif_width / 2),
+                dilation=1, groups=1, bias=True, padding_mode='zeros'
+            ).cuda()
+            self.conv_dropout = torch.nn.Dropout(p=self.conv_cif_dropout).cuda()
+            self.weight_proj = Linear(self.encoder_embed_dim, 1).cuda()
         else:
-            if targets is None:
-                current_tokens = self.sample_tokens(logits_coarse, temperature, top_k)
-            else:
-                current_tokens = torch.argmax(logits_coarse, dim=-1).detach()
+            self.weight_proj = Linear(self.encoder_embed_dim, 1).cuda()
 
-        # 2. DỰ ĐOÁN CASCADED (L1 -> L15)
-        for i in range(self.n_mels - 1):
-            # Hòa trộn Text Context và Audio Token hiện tại
-            emb_i = self.layer_embs[i](current_tokens)
-            # Fusion: Concatenate rồi đưa về hidden_size
-            gate_input = torch.cat([current_hidden, emb_i], dim=-1)
-            current_hidden = self.fusion_layers[i](gate_input)
+        if self.cif_output_dim != self.encoder_embed_dim:
+            self.cif_output_proj = Linear(self.encoder_embed_dim, self.cif_output_dim, bias=False).cuda()
+
+    def forward(self, encoder_outputs, target_lengths):
+        encoder_raw_outputs = encoder_outputs["encoder_raw_out"]
+        encoder_padding_mask = encoder_outputs["encoder_padding_mask"]
+        device = "cuda"
+
+        if self.produce_weight_type == "dense":
+            proj_out = self.dense_proj(encoder_raw_outputs)
+            act_proj_out = torch.relu(proj_out)
+            sig_input = self.weight_proj(act_proj_out)
+            weight = torch.sigmoid(sig_input)
+        elif self.produce_weight_type == "conv":
+            conv_input = encoder_raw_outputs.permute(0, 2, 1)
+            conv_out = self.conv(conv_input)
+            proj_input = conv_out.permute(0, 2, 1)
+            proj_input = self.conv_dropout(proj_input)
+            sig_input = self.weight_proj(proj_input)
+            weight = torch.sigmoid(sig_input)
+        else:
+            sig_input = self.weight_proj(encoder_raw_outputs)
+            weight = torch.sigmoid(sig_input)
+
+        not_padding_mask = ~encoder_padding_mask
+        weight = torch.squeeze(weight, dim=-1) * not_padding_mask.int()
+        org_weight = weight
+
+        if self.training and self.apply_scaling and target_lengths is not None:
+            weight_sum = weight.sum(-1)
+            normalize_scalar = torch.unsqueeze(target_lengths / weight_sum, -1)
+            weight = weight * normalize_scalar
+
+        batch_size = encoder_raw_outputs.size(0)
+        max_length = encoder_raw_outputs.size(1)
+        encoder_embed_dim = encoder_raw_outputs.size(2)
+        padding_start_id = not_padding_mask.sum(-1)
+
+        accumulated_weights = torch.zeros(batch_size, max_length, device=device)
+        accumulated_states = torch.zeros(batch_size, max_length, encoder_embed_dim, device=device)
+        fired_states = torch.zeros(batch_size, max_length, encoder_embed_dim, device=device)
+
+        for i in range(max_length):
+            prev_accumulated_weight = torch.zeros([batch_size], device=device) if i == 0 else accumulated_weights[:, i - 1]
+            prev_accumulated_state = torch.zeros([batch_size, encoder_embed_dim], device=device) if i == 0 else accumulated_states[:, i - 1, :]
+
+            cur_is_fired = ((prev_accumulated_weight + weight[:, i]) >= self.cif_threshold).unsqueeze(dim=-1)
+            cur_weight = torch.unsqueeze(weight[:, i], -1)
+            prev_accumulated_weight = torch.unsqueeze(prev_accumulated_weight, -1)
+            remained_weight = torch.ones_like(prev_accumulated_weight).to(device) - prev_accumulated_weight
+
+            cur_accumulated_weight = torch.where(
+                cur_is_fired, cur_weight - remained_weight, cur_weight + prev_accumulated_weight)
+            cur_accumulated_state = torch.where(
+                cur_is_fired.repeat(1, encoder_embed_dim),
+                (cur_weight - remained_weight) * encoder_raw_outputs[:, i, :],
+                prev_accumulated_state + cur_weight * encoder_raw_outputs[:, i, :])
+            cur_fired_state = torch.where(
+                cur_is_fired.repeat(1, encoder_embed_dim),
+                prev_accumulated_state + remained_weight * encoder_raw_outputs[:, i, :],
+                torch.zeros([batch_size, encoder_embed_dim]).cuda())
+
+            if (not self.training) and self.apply_tail_handling:
+                cur_fired_state = torch.where(
+                    i == padding_start_id.unsqueeze(dim=-1).repeat([1, encoder_embed_dim]),
+                    torch.where(
+                        cur_accumulated_weight.repeat([1, encoder_embed_dim]) <= self.tail_handling_firing_threshold,
+                        torch.zeros([batch_size, encoder_embed_dim]).cuda(),
+                        cur_accumulated_state / (cur_accumulated_weight + 1e-10)
+                    ), cur_fired_state)
+
+            cur_fired_state = torch.where(
+                torch.full([batch_size, encoder_embed_dim], i).cuda() >
+                padding_start_id.unsqueeze(dim=-1).repeat([1, encoder_embed_dim]),
+                torch.zeros([batch_size, encoder_embed_dim]).cuda(), cur_fired_state)
+
+            accumulated_weights[:, i] = cur_accumulated_weight.squeeze(-1) # Chú ý shape
+            accumulated_states[:, i, :] = cur_accumulated_state
+            fired_states[:, i, :] = cur_fired_state
+
+        fired_marks = (torch.abs(fired_states).sum(-1) != 0.0).int()
+        fired_utt_length = fired_marks.sum(-1)
+        fired_max_length = fired_utt_length.max().int()
+        cif_outputs_list = [] 
+
+        def dynamic_partition(data: torch.Tensor, partitions: torch.Tensor, num_partitions=None):
+            assert len(partitions.shape) == 1, "Only one dimensional partitions supported"
+            assert (data.shape[0] == partitions.shape[0]), "Partitions requires the same size as data"
+            if num_partitions is None:
+                num_partitions = max(torch.unique(partitions))
+            return [data[partitions == index] for index in range(num_partitions)]
+
+        for j in range(batch_size):
+            cur_utt_fired_mark = fired_marks[j, :]
+            cur_utt_fired_state = fired_states[j, :, :]
+            cur_utt_outputs = dynamic_partition(cur_utt_fired_state, cur_utt_fired_mark, 2)
+            cur_utt_output = cur_utt_outputs[1]
+            cur_utt_length = cur_utt_output.size(0)
+            pad_length = fired_max_length - cur_utt_length
             
-            # Chọn Decoder: 3 tầng đầu dùng não riêng, các tầng sau dùng chung
-            if i < 3:
-                h = self.priority_decoders[i](current_hidden.transpose(1, 2)).transpose(1, 2)
-            else:
-                h = self.fine_decoder_shared(current_hidden.transpose(1, 2)).transpose(1, 2)
+            # Tối ưu: Dùng torch.zeros với device thay vì .cuda() cứng
+            pad_tensor = torch.zeros([pad_length, encoder_embed_dim], dtype=cur_utt_output.dtype, device=device)
+            cur_utt_output = torch.cat((cur_utt_output, pad_tensor), dim=0)
             
-            # Dự đoán tầng tiếp theo
-            logits_i = self.fine_outputs[i](h)
-            logits_list.append(logits_i.unsqueeze(2))
+            cur_utt_output = torch.unsqueeze(cur_utt_output, 0)
             
-            # Cập nhật hidden state cho vòng lặp sau
-            current_hidden = h
-            
-            # Chuẩn bị Token cho tầng kế tiếp (Teacher Forcing hoặc Sample)
-            if i < self.n_mels - 2:
-                if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                    current_tokens = targets[:, :, i+1]
-                else:
-                    if targets is None:
-                        current_tokens = self.sample_tokens(logits_i, temperature, top_k)
-                    else:
-                        current_tokens = torch.argmax(logits_i, dim=-1).detach()
-                
-        return torch.cat(logits_list, dim=2)
-    
-class DurationPredictor(nn.Module):
-    """ Duration Predictor """
+            # Thêm vào list thay vì cat trực tiếp
+            cif_outputs_list.append(cur_utt_output)
 
-    def __init__(self, idim, filter_size=256, ksize=3, dropout=0.1, offset=1):
-        super(DurationPredictor, self).__init__()
-        self.input_size = idim
-        self.filter_size = filter_size
-        self.kernel = ksize
-        self.conv_output_size = filter_size
-        self.dropout = dropout
-        self.offset = offset
+        # 2. CHỈ THỰC HIỆN CAT 1 LẦN DUY NHẤT NGOÀI VÒNG LẶP
+        cif_outputs = torch.cat(cif_outputs_list, dim=0)
 
-        self.conv_layer = nn.Sequential(OrderedDict([
-            ("conv1d_1", Conv(self.input_size,
-                              self.filter_size,
-                              kernel_size=self.kernel,
-                              padding=1)),
-            ("layer_norm_1", nn.LayerNorm(self.filter_size)),
-            ("relu_1", nn.ReLU()),
-            ("dropout_1", nn.Dropout(self.dropout)),
-            ("conv1d_2", Conv(self.filter_size,
-                              self.filter_size,
-                              kernel_size=self.kernel,
-                              padding=1)),
-            ("layer_norm_2", nn.LayerNorm(self.filter_size)),
-            ("relu_2", nn.ReLU()),
-            ("dropout_2", nn.Dropout(self.dropout))
-        ]))
+        cif_out_padding_mask = (torch.abs(cif_outputs).sum(-1) != 0.0).int()
+        # --- KẾT THÚC ĐOẠN CODE SỬA ---
 
-        self.linear_layer = Linear(self.conv_output_size, 1)
+        if self.training:
+            quantity_out = org_weight.sum(-1)
+        else:
+            quantity_out = weight.sum(-1)
 
-    def forward(self, encoder_output):
-        # predict log(d_target + offset)
-        out = self.conv_layer(encoder_output)
-        out = self.linear_layer(out)
-        out = out.squeeze(-1)
-        return out
+        if self.cif_output_dim != encoder_embed_dim:
+            cif_outputs = self.cif_output_proj(cif_outputs)
 
-    def inference(self, encoder_output):
-        out = self.conv_layer(encoder_output)
-        out = self.linear_layer(out)
-        out = out.squeeze(-1)
-        out = torch.clamp(out.exp() - self.offset, min=0)
-        return out
+        return {
+            "cif_out": cif_outputs,
+            "cif_out_padding_mask": cif_out_padding_mask,
+            "quantity_out": quantity_out
+        }
 
 
-
-# --- 1. SETTINGS & HELPERS ---
-
-@dataclass
-class ModelArgs:
-    dim: int = 1024
-    n_layers: int = 6
-    n_heads: int = 8
-    n_kv_heads: Optional[int] = 2
-    vocab_size: int = 2048
-    multiple_of: int = 256
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-
-@dataclass
-# Lấy giá trị trực tiếp từ hparams bạn đã khởi tạo
-@dataclass
-class DecoderConfig:
-    # Lấy từ hparams.text_encoder_hidden (384)
-    idim: int = hparams.text_encoder_hidden   
-    # Lấy từ hparams.decoder_hidden (512)
-    hidden_size: int = hparams.decoder_hidden 
-    # Lấy từ hparams.vocab_size (365 - đây là token text, 
-    # nhưng nếu bạn dùng cho audio RVQ thì thường là 1024 hoặc 2048)
-    vocab_size: int = 2048 
-    # Lấy từ hparams.num_mels (16 layers audio)
-    num_codebooks: int = hparams.num_mels      
-    
-    # Layer settings (tùy chỉnh theo kiến trúc Transformer mới)
-    num_layers_coarse: int = hparams.decoder_layers # 6
-    num_layers_priority: int = 4
-    num_layers_shared: int = 2
-
-def sample_token(logits: torch.Tensor, topk: int = 5, temperature: float = 1.0) -> torch.Tensor:
-    # Thêm hàm sample đơn giản để code không báo lỗi
-    logits = logits / max(temperature, 1e-5)
-    v, _ = torch.topk(logits, min(topk, logits.size(-1)))
-    pivot = v[..., [-1]]
-    logits[logits < pivot] = -float('Inf')
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(*probs.shape[:-1])
-
-# --- 2. LLAMA BLOCKS (FROM SCRATCH) ---
+# ==========================================
+# 5. LLAMA & DECODER BLOCKS
+# ==========================================
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        
     def forward(self, x):
         return self.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
 
@@ -387,11 +369,6 @@ def apply_rotary_emb(xq, xk, freqs_cis):
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Lặp lại các KV heads để khớp với số lượng Q heads (Cần thiết cho Llama GQA).
-    Shape input: (B, T, n_kv_heads, head_dim)
-    Shape output: (B, T, n_heads, head_dim)
-    """
     if n_rep == 1:
         return x
     bs, sl, n_kv, hd = x.shape
@@ -401,15 +378,12 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, sl, n_kv * n_rep, hd)
     )
 
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_kv_heads if args.n_kv_heads is not None else args.n_heads
         self.head_dim = args.dim // args.n_heads
-        
-        # Tỷ lệ lặp lại đầu (ví dụ: 16 heads / 2 kv_heads = 8 lần lặp)
         self.n_rep = self.n_heads // self.n_kv_heads
         
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
@@ -427,11 +401,9 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # FIX: Lặp lại KV để khớp với Q trước khi nhân ma trận
         xk = repeat_kv(xk, self.n_rep)
         xv = repeat_kv(xv, self.n_rep)
 
-        # Chuyển về (B, Heads, T, Dim) để matmul
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
@@ -439,7 +411,7 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, xk.transpose(-2, -1)) / (self.head_dim ** 0.5)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         
-        output = torch.matmul(scores, xv) # (B, Heads, T, Dim)
+        output = torch.matmul(scores, xv)
         return self.wo(output.transpose(1, 2).contiguous().view(bsz, seqlen, -1))
 
 class FeedForward(nn.Module):
@@ -447,7 +419,10 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden_dim = int(8 * dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        self.w1, self.w2, self.w3 = nn.Linear(dim, hidden_dim, bias=False), nn.Linear(hidden_dim, dim, bias=False), nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
@@ -458,6 +433,7 @@ class TransformerBlock(nn.Module):
         self.feed_forward = FeedForward(args.dim, args.multiple_of)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        
     def forward(self, x, freqs_cis):
         x = x + self.attention(self.attention_norm(x), freqs_cis)
         return x + self.feed_forward(self.ffn_norm(x))
@@ -473,7 +449,6 @@ class LlamaTransformer(nn.Module):
         self.register_buffer("freqs_cis", precompute_freqs_cis(args.dim // args.n_heads, args.max_seq_len))
 
     def forward(self, x):
-        # x is embedding if tok_embeddings is Identity
         freqs_cis = self.freqs_cis[:x.shape[1]].to(x.device)
         for layer in self.layers:
             x = layer(x, freqs_cis)
@@ -493,10 +468,8 @@ class TransformerDecoderV3(nn.Module):
         super().__init__()
         self.config = config
         
-        # Thêm Projection Layer để khớp số chiều idim (n_channels) với hidden_size của Llama
         self.input_proj = nn.Linear(config.idim, config.hidden_size) if config.idim != config.hidden_size else nn.Identity()
         
-        # Khởi tạo các Llama blocks như cũ
         self.coarse_decoder, _ = prepare_transformer(
             get_llama3_2_from_scratch(num_layers=config.num_layers_coarse, num_heads=16, embed_dim=config.hidden_size)
         )
@@ -521,20 +494,18 @@ class TransformerDecoderV3(nn.Module):
         shifted_tokens = tokens + (layer_idx * self.config.vocab_size)
         return self.audio_embeddings(shifted_tokens)
 
-    # Thêm tham số top_k vào hàm forward
     def forward(self, text_features: torch.Tensor, targets: Optional[torch.Tensor] = None, temperature: float = 0.8, top_k: int = 5):
         text_features = self.input_proj(text_features)
-        B, T, _ = text_features.shape
         
         logits_list = []
-        sampled_tokens_list = [] # THÊM LIST NÀY: Để lưu token đã lấy mẫu
+        sampled_tokens_list = [] 
         
         h_coarse = self.coarse_decoder(text_features) 
         logits_0 = self.coarse_head(h_coarse)
         logits_list.append(logits_0.unsqueeze(2)) 
 
         current_tokens = targets[:, :, 0] if targets is not None else sample_token(logits_0, topk=top_k, temperature=temperature)
-        sampled_tokens_list.append(current_tokens.unsqueeze(2)) # Lưu lại
+        sampled_tokens_list.append(current_tokens.unsqueeze(2))
         current_hidden = h_coarse
 
         for i in range(self.config.num_codebooks - 1):
@@ -546,20 +517,16 @@ class TransformerDecoderV3(nn.Module):
             logits_i = self.fine_heads[i](h)
             logits_list.append(logits_i.unsqueeze(2))
             
-            # Xử lý cẩn thận cho token tiếp theo
             if targets is not None:
                 if i < self.config.num_codebooks - 2:
                     current_tokens = targets[:, :, i+1]
             else:
-                # Lúc inference, sample và lưu lại ngay lập tức
                 current_tokens = sample_token(logits_i, topk=top_k, temperature=temperature)
                 sampled_tokens_list.append(current_tokens.unsqueeze(2))
             
             current_hidden = h
 
-        # NẾU LÀ INFERENCE: Trả về trực tiếp Tokens (chứ không phải logits)
         if targets is None:
             return torch.cat(sampled_tokens_list, dim=2) 
             
-        # NẾU LÀ TRAIN: Trả về Logits để tính Loss
         return torch.cat(logits_list, dim=2)

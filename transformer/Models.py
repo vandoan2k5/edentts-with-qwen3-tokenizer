@@ -4,7 +4,6 @@ import numpy as np
 
 import transformer.Constants as Constants
 from .Layers import FFTBlock
-from models.layers import TokenEmbedding
 from hparams import hparams as hp
 
 
@@ -29,6 +28,15 @@ def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
         sinusoid_table[padding_idx] = 0.0
 
     return torch.FloatTensor(sinusoid_table)
+
+class TokenEmbedding(nn.Module):
+    """Lớp Embedding cho Phonemes/Text"""
+    def __init__(self, hidden_size=384, padding_idx=0, vocab_size=365):
+        super().__init__()
+        self.phone_embed_layer = nn.Embedding(vocab_size, hidden_size, padding_idx=padding_idx)
+
+    def forward(self, phone_ids):
+        return self.phone_embed_layer(phone_ids)
 
 
 class Encoder(nn.Module):

@@ -54,7 +54,7 @@ def get_tts_datasets(path: Path, batch_size):
                            collate_fn=Collate_tts(),
                            batch_size=batch_size,
                            sampler=sampler,
-                           num_workers=1,
+                           num_workers=16,
                            pin_memory=True)
     if len(test_ids) > 0:
         test_dataset = TTSDataset(path, test_ids)

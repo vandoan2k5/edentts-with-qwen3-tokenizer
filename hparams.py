@@ -1,111 +1,114 @@
 import os
 import json
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 
+# ==========================================
+# 1. CONFIG SCHEMAS (Dành cho việc Import)
+# ==========================================
 
-# Global settings
+@dataclass
+class CifConfig:
+    cif_threshold: float = 0.999
+    cif_embedding_dim: int = 512
+    encoder_embed_dim: int = 384
+    produce_weight_type: str = "conv"
+    conv_cif_width: int = 3
+    conv_cif_dropout: float = 0.1
+    apply_scaling: bool = True
+    apply_tail_handling: bool = True
+    tail_handling_firing_threshold: float = 0.5
+
+@dataclass
+class ModelArgs:
+    dim: int = 512
+    n_layers: int = 6
+    n_heads: int = 8
+    n_kv_heads: Optional[int] = 2
+    vocab_size: int = 2048
+    multiple_of: int = 256
+    norm_eps: float = 1e-5
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
+
+@dataclass
+class DecoderConfig:
+    idim: int = 512
+    hidden_size: int = 384
+    vocab_size: int = 2048
+    num_codebooks: int = 16
+    num_layers_coarse: int = 4
+    num_layers_priority: int = 2
+    num_layers_shared: int = 1
+
+# ==========================================
+# 2. MAIN HPARAMS CLASS
+# ==========================================
+
 class Hparams(object):
     def __init__(self, data=None):
-        # this is a configuration file, the setting in the file
-        # will overwrite default settings in this object
-        # the name of the config file will be used as experimental id
-        self.config_file = f"config/eden.json"
+        self.config_file = "config/eden.json"
         if data is not None:
             self.config_file = data
-        print(f"config_file: {self.config_file}")
-        # path to the pretrained hifigan vocoder
-        # pretrained hifigan vocoder can be downloaded from: https://drive.google.com/drive/folders/1-eEYTB5Av9jNql0WGBlRoi-WH2J7bp5Y
-        # we use the model LJ_FT_T2_V1 in the article
-        self.voc_path = "path/to/hifigan_vocoder"
-        self.voc_path = r"C:\Users\home\Desktop\hifigan\pretrained\lj_wo_ft.pth.tar"
-        self.vocab_size = 4096  # number of input tokens
-        # Training
-        self.tts_max_steps = 50000  #You may stop at around 100_000 for ljspeech dataset for acceptable speech quality
-        self.tts_max_mel_len = 400
+            
+        # Giá trị mặc định
+        self.vocab_size = 365 
+        self.text_encoder_hidden = 384
+        self.n_channels = 512
+        self.decoder_hidden = 512
+        self.num_mels = 16 
+        self.pos_embed_scheme = "none"
+        self.text_encoder_layers = 6
+        self.text_encoder_dropout = 0.2
+        self.data_path = os.path.join("./", r'data')
+        self.base_path = r'./'
+        self.token_type = "char"
+
+
+
+        self.sample_rate = 22050
+        self.n_fft = 1024
+        self.fft_bins = self.n_fft // 2 + 1
+        self.num_mels = 80
+        self.hop_length = 256 # 12.5ms - in line with Tacotron 2 paper
+        self.win_length = 1024   # 50ms - same reason as above
+        self.fmin = 0
+        self.fmax = 8000
+        self.bits = 16
+
+
+        self.tts_max_steps = 50000  # you may stop at around 100_000 for ljspeech dataset for acceptable speech quality
+        self.tts_max_mel_len = 100
         self.tts_bin_lengths = True   # bins the spectrogram lengths before sampling in data loader - speeds up training
         self.tts_checkpoint_every = 5000  # checkpoints the model every X steps
         self.tts_show_info_every = 2   # print tran status every X steps
         self.tts_eval_every = 30
         self.lr = 1e-4
-        self.batch_size = 128
+        self.batch_size = 64
 
-        # token type, can be char or phonemes,
-        # we use char in our article
-        self.token_type = "char"
-        # wether to add a postnet after the decoder
-        self.use_postnet = False
-        # the speaker aims to specify the task space of the training. You can include other dataset in your datapath.
-        self.speaker = "ljs"
-
-        self.base_path = r'./'
-        self.data_path = os.path.join("./", r'data')
-
-        # either "none" or "absolute", using the absolute position will lead to the original FFT of fastspeech
-        # in our experiment we found using none position position embedding in our architecture
-        # lead to slightly better results, especially for long sentences
-        self.pos_embed_scheme = "none"  # ["none", "absolute"]
-        # CONFIG -------------------------------------------------------------------------------------------------#
-        # model configs, will be overiten by the config file
-        self.delta = 0.2
-        self.n_channels = 512
-        self.text_encoder = "fft"
-        self.text_encoder_layers = 5
-        self.text_encoder_dropout = 0.2
-        self.text_encoder_hidden = 384
-
-        self.decoder_dropout = 0.2
-        self.decoder_layers = 6
-        self.decoder_ksize = 5
-        self.decoder_dilation = [1, 2, 2, 2, 1, 1]
-        self.decoder_hidden = 512
-
-        self.mel_encoder_layers = 4
-        self.mel_encoder_dilation = [1, 2, 2, 3]
-        self.mel_encoder_ksize = 5
-        self.mel_encoder_dropout = 0.1
-        self.mel_encoder_hidden = 512
-
-        self.duration_predictor_ksize = 3
-        self.duration_predictor_filter_zie = 256
-        self.duration_predicotr_dropout = 0.5
-
-        # DSP --------------------------------------------------------------------------------------------------------#
-        # Settings for all models fix
-        self.sample_rate = 22050
-        self.n_fft = 1024
-        self.fft_bins = self.n_fft // 2 + 1
-        self.num_mels = 16
-        self.hop_length = 1764 # 12.5ms - in line with Tacotron 2 paper
-        self.win_length = 1024   # 50ms - same reason as above
-        self.fmin = 0
-        self.fmax = 8000
-        self.bits = 16  # bit depth of signal
-
-        # CIF CONFIG ---------------------------------------------------------#
-        self.cif_threshold = 0.999 
-        self.encoder_embed_dim = self.n_channels           # <--- ĐỔI Ở ĐÂY (thay vì text_encoder_hidden)
-        self.cif_embedding_dim = self.n_channels           
-        self.produce_weight_type = "conv"                  
-        self.conv_cif_width = 3
-        self.conv_cif_dropout = 0.1
-        self.apply_scaling = True
-        self.apply_tail_handling = True
-        self.tail_handling_firing_threshold = 0.5
-
-        # ----------------------------------------------------------------------------------------------------------------#
-        # overwrite default settings with config file
-        if data is not None:
-            self.config_file = data
+        # Đọc file config (eden.json)
         if os.path.exists(self.config_file):
-            from pathlib import Path
-            data = self.config_file
-            tag = Path(data).stem
-            with open(data, 'r', encoding="utf-8") as fhand:
-                data = json.load(fhand)
-            for key, value in data.items():
+            with open(self.config_file, 'r', encoding="utf-8") as f:
+                config_data = json.load(f)
+            for key, value in config_data.items():
                 setattr(self, key, value)
-        else:
-            raise Exception("empty config file")
-        self.tts_model_id = f"tts_{tag}"
+            print(f"✅ Loaded config from {self.config_file}")
+        
+        self.tts_model_id = "cif_tts"
 
+    def get_cif_config(self):
+        return CifConfig(
+            cif_embedding_dim=self.n_channels,        # Thường là 512
+            encoder_embed_dim=self.text_encoder_hidden # Thường là 384
+        )
+
+    def get_decoder_config(self):
+        return DecoderConfig(
+            idim=self.n_channels,                     # Đầu vào khớp với đầu ra CIF
+            hidden_size=self.decoder_hidden,           # Thường là 512
+            num_codebooks=self.num_mels,
+            num_layers_coarse=getattr(self, 'decoder_layers', 6)
+        )
 
 hparams = Hparams()

@@ -51,7 +51,6 @@ def process_wav(path: Path):
 
 
 def main(wav_path, n_workers=4):
-    tokenizer = Tokenizer.from_file("./tts-bpe-tokenizer-v3.json")
     # 0. wav processing
     simple_table([
         ('Sample Rate', hp.sample_rate),
@@ -84,8 +83,11 @@ def main(wav_path, n_workers=4):
             items = line.split("|")
             id = items[0]
             text = items[-1]
-            phone = tokenizer.encode(text)
-            np.save(paths.phone / f"{id}.npy", phone.ids, allow_pickle=False)
+            if hp.token_type == "char":
+                phone = np.array(text_to_sequence(text, token_type="char"))
+            else:
+                phone = np.array(text_to_sequence(text, token_type="ph"))
+            np.save(paths.phone / f"{id}.npy", phone, allow_pickle=False)
             bar = progbar(i, len(lines))
             message = f'{bar} {i}/{len(lines)} '
             stream(message)
