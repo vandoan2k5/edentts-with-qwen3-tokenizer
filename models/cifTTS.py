@@ -86,7 +86,23 @@ class CifTTSModel(AbstractModel):
         cif_ret = self.cif(encoder_outputs, target_audio_lengths)
         cif_out = cif_ret["cif_out"]
         quantity_out = cif_ret["quantity_out"]
-        
+
+
+        if target_audio_tokens is not None:
+            target_len = target_audio_tokens.size(1)
+            cif_len = cif_out.size(1)
+            
+            if cif_len < target_len:
+                # Nếu CIF ngắn hơn, đệm thêm zeros
+                pad_tensor = torch.zeros(
+                    cif_out.size(0), target_len - cif_len, cif_out.size(2), 
+                    dtype=cif_out.dtype, device=cif_out.device
+                )
+                cif_out = torch.cat([cif_out, pad_tensor], dim=1)
+            elif cif_len > target_len:
+                # Nếu CIF dài hơn, cắt bớt phần dư
+                cif_out = cif_out[:, :target_len, :]
+                
         # --- BƯỚC 3: DECODING ---
         decoder_out = self.decoder(
             text_features=cif_out,

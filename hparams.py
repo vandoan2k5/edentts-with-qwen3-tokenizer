@@ -85,7 +85,7 @@ class Hparams(object):
         self.tts_show_info_every = 2   # print tran status every X steps
         self.tts_eval_every = 30
         self.lr = 1e-4
-        self.batch_size = 64
+        self.batch_size = 16
 
         # Đọc file config (eden.json)
         if os.path.exists(self.config_file):

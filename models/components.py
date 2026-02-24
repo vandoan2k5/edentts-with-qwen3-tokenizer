@@ -217,7 +217,7 @@ class CifMiddleware(nn.Module):
     def forward(self, encoder_outputs, target_lengths):
         encoder_raw_outputs = encoder_outputs["encoder_raw_out"]
         encoder_padding_mask = encoder_outputs["encoder_padding_mask"]
-        device = "cuda"
+        device = encoder_raw_outputs.device
 
         if self.produce_weight_type == "dense":
             proj_out = self.dense_proj(encoder_raw_outputs)

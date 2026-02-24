@@ -111,6 +111,8 @@ def tts_train(paths, model, optimizer, criterion, train_set, lr, train_steps, at
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+            model.step += 1
+            step = model.get_step()
             # 4. TÍNH TOÁN STATS (Accuracy L0 -> L3)
             stats = dict()
             with torch.no_grad():
@@ -147,20 +149,20 @@ def tts_train(paths, model, optimizer, criterion, train_set, lr, train_steps, at
                 msg = f'| Ep: {e} | Step: {step} | {stats_str(stats)} | {speed:#.2} st/s'
                 log.info(msg)
 
-            if step % hp.tts_checkpoint_every == 0:
-                save_checkpoint('tts', paths, model, optimizer, name=f'step_{step}', is_silent=True)
+            # if step % hp.tts_checkpoint_every == 0:
+            #     save_checkpoint('tts', paths, model, optimizer, name=f'step_{step}', is_silent=True)
 
             # Visualization (Giữ nguyên logic cũ)
-            if attn_example in ids:
-                idx = ids.index(attn_example)
-                mel_len = mel_lens[idx].item()
-                p_mel_ids = torch.argmax(mel_pred[idx, :mel_len, 0, :], dim=-1) # Plot layer 0
-                save_spectrogram(np_now(p_mel_ids.float() / 2048.0), paths.tts_mel_plot / f'{step}', 600)
+            # if attn_example in ids:
+            #     idx = ids.index(attn_example)
+            #     mel_len = mel_lens[idx].item()
+            #     p_mel_ids = torch.argmax(mel_pred[idx, :mel_len, 0, :], dim=-1) # Plot layer 0
+            #     save_spectrogram(np_now(p_mel_ids.float() / 2048.0), paths.tts_mel_plot / f'{step}', 600)
 
             if step >= train_steps: break
         if step >= train_steps: break
 
-    save_checkpoint('tts', paths, model, optimizer, is_silent=False)
+    # save_checkpoint('tts', paths, model, optimizer, is_silent=False)
 
 def get_mask_from_lengths(lengths, max_len=None):
     if max_len is None: max_len = torch.max(lengths).item()
