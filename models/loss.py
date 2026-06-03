@@ -6,7 +6,7 @@ class CifTTSLoss(nn.Module):
     def __init__(self, delta=0.2):
         super().__init__()
         self.delta = delta # Trọng số cho Quantity Loss (từ eden.json)
-        self.mse_loss = nn.MAELoss()
+        self.mse_loss = nn.MSELoss()
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1) # Giả sử -1 là padding cho audio tokens
 
     def forward(self, model_outputs, target_audio_tokens, target_audio_lengths):

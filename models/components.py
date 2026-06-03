@@ -253,17 +253,32 @@ class CifMiddleware(nn.Module):
         accumulated_states = torch.zeros(batch_size, max_length, encoder_embed_dim, device=device)
         fired_states = torch.zeros(batch_size, max_length, encoder_embed_dim, device=device)
 
+        # Track per-position contributions to each fired frame.
+        # contributions[b, i, j] = how much of text position i ends up in audio frame j.
+        # We don't know T_aud yet, so we allocate the upper bound [B, T_txt, T_txt]
+        # and slice at the end. We also keep, per-batch, a list of (pos, weight)
+        # pairs that are currently in the accumulation pool - this lets us
+        # attribute the prev_accumulated part of each fire to the contributing
+        # text positions proportionally to their weight. When the pool is empty
+        # (the previous position just fired), the prev_accumulated is the
+        # residual produced by that previous fire, so we attribute it back to
+        # the previous firing position via `last_firing_pos`.
+        contributions = torch.zeros(batch_size, max_length, max_length, device=device)
+        accumulated_lists = [[] for _ in range(batch_size)]
+        fire_counters = [0] * batch_size
+        last_firing_pos = [-1] * batch_size
+
         for i in range(max_length):
             prev_accumulated_weight = torch.zeros([batch_size], device=device) if i == 0 else accumulated_weights[:, i - 1]
             prev_accumulated_state = torch.zeros([batch_size, encoder_embed_dim], device=device) if i == 0 else accumulated_states[:, i - 1, :]
 
             cur_is_fired = ((prev_accumulated_weight + weight[:, i]) >= self.cif_threshold).unsqueeze(dim=-1)
             cur_weight = torch.unsqueeze(weight[:, i], -1)
-            prev_accumulated_weight = torch.unsqueeze(prev_accumulated_weight, -1)
-            remained_weight = torch.ones_like(prev_accumulated_weight).to(device) - prev_accumulated_weight
+            prev_accumulated_weight_unsq = torch.unsqueeze(prev_accumulated_weight, -1)
+            remained_weight = torch.ones_like(prev_accumulated_weight_unsq).to(device) - prev_accumulated_weight_unsq
 
             cur_accumulated_weight = torch.where(
-                cur_is_fired, cur_weight - remained_weight, cur_weight + prev_accumulated_weight)
+                cur_is_fired, cur_weight - remained_weight, cur_weight + prev_accumulated_weight_unsq)
             cur_accumulated_state = torch.where(
                 cur_is_fired.repeat(1, encoder_embed_dim),
                 (cur_weight - remained_weight) * encoder_raw_outputs[:, i, :],
@@ -290,6 +305,28 @@ class CifMiddleware(nn.Module):
             accumulated_weights[:, i] = cur_accumulated_weight.squeeze(-1) # Chú ý shape
             accumulated_states[:, i, :] = cur_accumulated_state
             fired_states[:, i, :] = cur_fired_state
+
+            # Per-position contribution tracking.
+            for b in range(batch_size):
+                if cur_is_fired[b, 0].item():
+                    j = fire_counters[b]
+                    if j < max_length:
+                        # Position i itself contributes `remained_weight` to this fire.
+                        contributions[b, i, j] = remained_weight[b, 0].item()
+                        # Every position that was in the accumulation pool also
+                        # contributes its full weight (it is consumed by this fire).
+                        for (pos, w) in accumulated_lists[b]:
+                            contributions[b, pos, j] = w
+                    fire_counters[b] += 1
+                    last_firing_pos[b] = i
+                    # The residual cur_accumulated_weight is the leftover weight
+                    # that wasn't consumed by this fire. Carry it forward as an
+                    # attributed contribution from position i so the pool stays
+                    # consistent with prev_accumulated at the next step.
+                    residual = cur_accumulated_weight[b, 0].item()
+                    accumulated_lists[b] = [(i, residual)] if residual > 0 else []
+                else:
+                    accumulated_lists[b].append((i, weight[b, i].item()))
 
         fired_marks = (torch.abs(fired_states).sum(-1) != 0.0).int()
         fired_utt_length = fired_marks.sum(-1)
@@ -334,10 +371,18 @@ class CifMiddleware(nn.Module):
         if self.cif_output_dim != encoder_embed_dim:
             cif_outputs = self.cif_output_proj(cif_outputs)
 
+        # Slice the contribution matrix to the actual number of fires per batch.
+        # We use the max so all batches share the same shape (padded with zeros).
+        max_fires = max(fire_counters) if fire_counters else 0
+        contributions = contributions[:, :, :max_fires]
+
         return {
             "cif_out": cif_outputs,
             "cif_out_padding_mask": cif_out_padding_mask,
-            "quantity_out": quantity_out
+            "quantity_out": quantity_out,
+            "fired_marks": fired_marks,
+            "accumulated_weights": accumulated_weights,
+            "contributions": contributions,
         }
 
 
